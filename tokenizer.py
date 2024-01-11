@@ -14,12 +14,10 @@ def export():
 
     # get all the tokens
     tokens = []
-    for i in range(tokenizer.vocab_size):
-        t = tokenizer.decode([i])
-        b = t.encode('utf-8')   # bytes of this token, utf-8 encoded
+    for i in range(50277):        # tokenizer.vocab_size is returning 50254, but ...
+        t = tokenizer.decode([i]) # ... there are 50277 tokens in the tokenizer.json file
+        b = t.encode('utf-8')     # bytes of this token, utf-8 encoded
         tokens.append(b)
-
-    # NOTE: the above is not including the remaining special tokens that are present in the tokenizer.json file
 
     # record the max token length
     max_token_length = max(len(t) for t in tokens)

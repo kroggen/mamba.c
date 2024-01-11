@@ -460,7 +460,6 @@ typedef struct {
 
 typedef struct {
     char** vocab;
-    float* vocab_scores;
     TokenIndex *sorted_vocab;
     int vocab_size;
     unsigned int max_token_length;
@@ -471,13 +470,8 @@ int compare_tokens(const void *a, const void *b) {
     return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
 
-void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
-    // i should have written the vocab_size into the tokenizer file... sigh
-    t->vocab_size = vocab_size;
-    // malloc space to hold the scores and the strings
-    t->vocab = (char**)malloc(vocab_size * sizeof(char*));
-    t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));
-    t->sorted_vocab = NULL; // initialized lazily
+void build_tokenizer(Tokenizer* t, char* tokenizer_path, int model_vocab_size) {
+    // initialize the byte_pieces array
     for (int i = 0; i < 256; i++) {
         t->byte_pieces[i * 2] = (unsigned char)i;
         t->byte_pieces[i * 2 + 1] = '\0';
@@ -485,10 +479,27 @@ void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
     // read in the file
     FILE *file = fopen(tokenizer_path, "rb");
     if (!file) { fprintf(stderr, "couldn't load %s\n", tokenizer_path); exit(EXIT_FAILURE); }
+    // read header magic
+    unsigned int magic;
+    if (fread(&magic, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
+    if (magic != 0x4d62546b) { fprintf(stderr, "invalid magic number: %x\n", magic); exit(EXIT_FAILURE); }
+    // read version
+    int version;
+    if (fread(&version, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
+    if (version != 1) { fprintf(stderr, "invalid version: %d\n", version); exit(EXIT_FAILURE); }
+    // read vocab_size
+    int vocab_size;
+    if (fread(&vocab_size, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
+    // read max_token_length
     if (fread(&t->max_token_length, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
+    // malloc space for the vocab
+    t->vocab_size = vocab_size;
+    t->vocab = (char**)malloc(vocab_size * sizeof(char*));
+    if (!t->vocab) { fprintf(stderr, "malloc failed\n"); exit(EXIT_FAILURE); }
+    t->sorted_vocab = NULL; // initialized lazily
+    // read vocab
     int len;
     for (int i = 0; i < vocab_size; i++) {
-        if (fread(t->vocab_scores + i, sizeof(float), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE);}
         if (fread(&len, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
         t->vocab[i] = (char *)malloc(len + 1);
         if (fread(t->vocab[i], len, 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
@@ -500,7 +511,6 @@ void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
 void free_tokenizer(Tokenizer* t) {
     for (int i = 0; i < t->vocab_size; i++) { free(t->vocab[i]); }
     free(t->vocab);
-    free(t->vocab_scores);
     free(t->sorted_vocab);
 }
 
@@ -622,9 +632,8 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         str_len = 0; // protect against a sequence of stray UTF8 continuation bytes
     }
 
-    // merge the best consecutive pair each iteration, according the scores in vocab_scores
+    // merge the best consecutive pair each iteration
     while (1) {
-        float best_score = -1e10;
         int best_id = -1;
         int best_idx = -1;
 
@@ -632,11 +641,11 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
             // check if we can merge the pair (tokens[i], tokens[i+1])
             sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
             int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
-            if (id != -1 && t->vocab_scores[id] > best_score) {
-                // this merge pair exists in vocab! record its score and position
-                best_score = t->vocab_scores[id];
+            if (id != -1) {
+                // this merge pair exists in vocab! record its position
                 best_id = id;
                 best_idx = i;
+                break;
             }
         }
 

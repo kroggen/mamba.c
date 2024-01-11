@@ -1,4 +1,4 @@
-/* Inference for Llama-2 Transformer model in pure C */
+/* Inference for Mamba model in pure C */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,170 +14,182 @@
     #include <sys/mman.h>
 #endif
 // ----------------------------------------------------------------------------
-// Transformer model
+// Mamba model
 
 typedef struct {
-    int dim; // transformer dimension
-    int hidden_dim; // for ffn layers
-    int n_layers; // number of layers
-    int n_heads; // number of query heads
-    int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
-    int vocab_size; // vocabulary size, usually 256 (byte-level)
-    int seq_len; // max sequence length
+    int n_layers;   // number of layers
+    int vocab_size; // vocabulary size
+    int dim;        // embedding dimension
+    int d_inner;
+    int dt_rank;
+    int d_state;
+    int d_conv;
+    int shared_classifier;
+    int rounded_vocab_size; // vocab_size rounded up to the nearest multiple of 8
 } Config;
 
 typedef struct {
     // token embedding table
-    float* token_embedding_table;    // (vocab_size, dim)
-    // weights for rmsnorms
-    float* rms_att_weight; // (layer, dim) rmsnorm weights
-    float* rms_ffn_weight; // (layer, dim)
-    // weights for matmuls. note dim == n_heads * head_size
-    float* wq; // (layer, dim, n_heads * head_size)
-    float* wk; // (layer, dim, n_kv_heads * head_size)
-    float* wv; // (layer, dim, n_kv_heads * head_size)
-    float* wo; // (layer, n_heads * head_size, dim)
-    // weights for ffn
-    float* w1; // (layer, hidden_dim, dim)
-    float* w2; // (layer, dim, hidden_dim)
-    float* w3; // (layer, hidden_dim, dim)
+    float* token_embedding_table; // (rounded_vocab_size, dim)
+    // weights for layers
+    float* in_proj;        // (layer, 2*d_inner, dim)
+    float* conv1d_weight;  // (layer, d_inner, 1, d_conv)
+    float* conv1d_bias;    // (layer, d_inner)
+    float* x_proj;         // (layer, dt_rank+2*d_state, d_inner)
+    float* dt_proj_weight; // (layer, d_inner, dt_rank)
+    float* dt_proj_bias;   // (layer, d_inner)
+    float* A;              // (layer, d_inner, d_state)
+    float* D;              // (layer, d_inner)
+    float* out_proj;       // (layer, dim, d_inner)
+    float* norm;           // (layer, dim)
     // final rmsnorm
-    float* rms_final_weight; // (dim,)
+    float* final_norm;     // (dim)
     // (optional) classifier weights for the logits, on the last layer
-    float* wcls;
-} TransformerWeights;
+    float* lm_head;        // (rounded_vocab_size, dim)
+} MambaWeights;
 
 typedef struct {
-    // current wave of activations
-    float *x; // activation at current time stamp (dim,)
-    float *xb; // same, but inside a residual branch (dim,)
-    float *xb2; // an additional buffer just for convenience (dim,)
-    float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *q; // query (dim,)
-    float *k; // key (dim,)
-    float *v; // value (dim,)
-    float *att; // buffer for scores/attention values (n_heads, seq_len)
-    float *logits; // output logits
-    // kv cache
-    float* key_cache;   // (layer, seq_len, dim)
-    float* value_cache; // (layer, seq_len, dim)
+    // memory reused by all layers
+    float* input;        // (dim)
+    float* hidden_state; // (dim)
+    float *xz;     // (2*d_inner)          x and z are pointers into this buffer
+    float *x_db;   // (dt_rank+2*d_state)  dt, B, C are pointers into this buffer
+    float *dt;     // (d_inner)            later, dt is a pointer to this buffer
+    float *dA;     // (d_inner, d_state)
+    float *dB;     // (d_inner, d_state)
+    float *temp;   // (d_inner, d_state)
+    float *y;      // (d_inner)
+    float *logits; // (rounded_vocab_size)
+    // internal state, separate memory for each layer
+    float* conv_state; // (n_layers, d_inner, d_conv)
+    float* ssm_state;  // (n_layers, d_inner, d_state)
 } RunState;
 
 typedef struct {
     Config config; // the hyperparameters of the architecture (the blueprint)
-    TransformerWeights weights; // the weights of the model
+    MambaWeights weights; // the weights of the model
     RunState state; // buffers for the "wave" of activations in the forward pass
     // some more state needed to properly clean up the memory mapping (sigh)
     int fd; // file descriptor for memory mapping
     float* data; // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
-} Transformer;
+} Mamba;
 
 void malloc_run_state(RunState* s, Config* p) {
-    // we calloc instead of malloc to keep valgrind happy
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    s->x = calloc(p->dim, sizeof(float));
-    s->xb = calloc(p->dim, sizeof(float));
-    s->xb2 = calloc(p->dim, sizeof(float));
-    s->hb = calloc(p->hidden_dim, sizeof(float));
-    s->hb2 = calloc(p->hidden_dim, sizeof(float));
-    s->q = calloc(p->dim, sizeof(float));
-    s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
-    s->logits = calloc(p->vocab_size, sizeof(float));
+    // memory reused by all layers
+    s->input = calloc(p->dim, sizeof(float));
+    s->hidden_state = calloc(p->dim, sizeof(float));
+    s->xz = calloc(2 * p->d_inner, sizeof(float));
+    s->x_db = calloc(p->dt_rank + 2 * p->d_state, sizeof(float));
+    s->dt = calloc(p->d_inner, sizeof(float));
+    s->dA = calloc(p->d_inner * p->d_state, sizeof(float));
+    s->dB = calloc(p->d_inner * p->d_state, sizeof(float));
+    s->temp = calloc(p->d_inner * p->d_state, sizeof(float));
+    s->y = calloc(p->d_inner, sizeof(float));
+    s->logits = calloc(p->rounded_vocab_size, sizeof(float));
+    // internal state, separate memory for each layer
+    s->conv_state = calloc(p->n_layers * p->d_inner * p->d_conv, sizeof(float));
+    s->ssm_state = calloc(p->n_layers * p->d_inner * p->d_state, sizeof(float));
     // ensure all mallocs went fine
-    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
+    if (!s->xz || !s->x_db || !s->dt || !s->dA || !s->dB || !s->temp || !s->y
+     || !s->logits || !s->conv_state || !s->ssm_state) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
 }
 
+void reset_internal_state(Mamba* mamba) {
+    // reset the internal state of the model
+    RunState* s = &mamba->state;
+    Config* p = &mamba->config;
+    memset(s->conv_state, 0, p->n_layers * p->d_inner * p->d_conv * sizeof(float));
+    memset(s->ssm_state, 0, p->n_layers * p->d_inner * p->d_state * sizeof(float));
+}
+
 void free_run_state(RunState* s) {
-    free(s->x);
-    free(s->xb);
-    free(s->xb2);
-    free(s->hb);
-    free(s->hb2);
-    free(s->q);
-    free(s->att);
+    free(s->input);
+    free(s->hidden_state);
+    free(s->xz);
+    free(s->x_db);
+    free(s->dt);
+    free(s->dA);
+    free(s->dB);
+    free(s->temp);
+    free(s->y);
     free(s->logits);
-    free(s->key_cache);
-    free(s->value_cache);
+    free(s->conv_state);
+    free(s->ssm_state);
 }
 
-void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
-    int head_size = p->dim / p->n_heads;
-    // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
+void memory_map_weights(MambaWeights *w, Config* p, float* ptr) {
+    // the multiplications below are done in 64-bit to fit the parameter counts of 13B+ models
     unsigned long long n_layers = p->n_layers;
-    w->token_embedding_table = ptr;
-    ptr += p->vocab_size * p->dim;
-    w->rms_att_weight = ptr;
-    ptr += n_layers * p->dim;
-    w->wq = ptr;
-    ptr += n_layers * p->dim * (p->n_heads * head_size);
-    w->wk = ptr;
-    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wv = ptr;
-    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wo = ptr;
-    ptr += n_layers * (p->n_heads * head_size) * p->dim;
-    w->rms_ffn_weight = ptr;
-    ptr += n_layers * p->dim;
-    w->w1 = ptr;
-    ptr += n_layers * p->dim * p->hidden_dim;
-    w->w2 = ptr;
-    ptr += n_layers * p->hidden_dim * p->dim;
-    w->w3 = ptr;
-    ptr += n_layers * p->dim * p->hidden_dim;
-    w->rms_final_weight = ptr;
-    ptr += p->dim;
-    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
-    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
-    w->wcls = shared_weights ? w->token_embedding_table : ptr;
+    // get the pointers to the weights
+    w->token_embedding_table = ptr;  ptr += p->rounded_vocab_size * p->dim;
+    w->in_proj = ptr;                ptr += n_layers * (2 * p->d_inner) * p->dim;
+    w->conv1d_weight = ptr;          ptr += n_layers * p->d_inner * 1 * p->d_conv;
+    w->conv1d_bias = ptr;            ptr += n_layers * p->d_inner;
+    w->x_proj = ptr;                 ptr += n_layers * (p->dt_rank + 2 * p->d_state) * p->d_inner;
+    w->dt_proj_weight = ptr;         ptr += n_layers * p->d_inner * p->dt_rank;
+    w->dt_proj_bias = ptr;           ptr += n_layers * p->d_inner;
+    w->A = ptr;                      ptr += n_layers * p->d_inner * p->d_state;
+    w->D = ptr;                      ptr += n_layers * p->d_inner;
+    w->out_proj = ptr;               ptr += n_layers * p->dim * p->d_inner;
+    w->norm = ptr;                   ptr += n_layers * p->dim;
+    w->final_norm = ptr;             ptr += p->dim;
+    // the classifier weights can be shared with the token embedding table
+    w->lm_head = p->shared_classifier ? w->token_embedding_table : ptr;
 }
 
-void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
+void load_model_file(char* model_path, Config* config, MambaWeights* weights,
                      int* fd, float** data, ssize_t* file_size) {
-    FILE *file = fopen(checkpoint, "rb");
-    if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
-    // read in the config header
+    FILE *file = fopen(model_path, "rb");
+    if (!file) { fprintf(stderr, "Couldn't open file %s\n", model_path); exit(EXIT_FAILURE); }
+    // read the magic number
+    unsigned int magic;
+    if (fread(&magic, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (magic != 0x4d616d62) { fprintf(stderr, "Invalid magic number: %x\n", magic); exit(EXIT_FAILURE); }
+    // read the version
+    int version;
+    if (fread(&version, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (version != 1) { fprintf(stderr, "Invalid version: %d\n", version); exit(EXIT_FAILURE); }
+    // read the config
     if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
-    // negative vocab size is hacky way of signaling unshared weights. bit yikes.
-    int shared_weights = config->vocab_size > 0 ? 1 : 0;
-    config->vocab_size = abs(config->vocab_size);
+    if (config->vocab_size % 8 != 0) {
+        config->rounded_vocab_size = config->vocab_size + (8 - (config->vocab_size % 8));
+    } else {
+        config->rounded_vocab_size = config->vocab_size;
+    }
     // figure out the file size
     fseek(file, 0, SEEK_END); // move file pointer to end of file
     *file_size = ftell(file); // get the file size, in bytes
     fclose(file);
-    // memory map the Transformer weights into the data pointer
-    *fd = open(checkpoint, O_RDONLY); // open in read only mode
+    // memory map the model weights into the data pointer
+    *fd = open(model_path, O_RDONLY); // open in read only mode
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
     *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-    float* weights_ptr = *data + sizeof(Config)/sizeof(float);
-    memory_map_weights(weights, config, weights_ptr, shared_weights);
+    float* weights_ptr = *data + (256 / 4);
+    memory_map_weights(weights, config, weights_ptr);
 }
 
-void build_transformer(Transformer *t, char* checkpoint_path) {
-    // read in the Config and the Weights from the checkpoint
-    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
+void load_model(Mamba* m, char* model_path) {
+    // read the Config and the Weights from the model file
+    load_model_file(model_path, &m->config, &m->weights, &m->fd, &m->data, &m->file_size);
     // allocate the RunState buffers
-    malloc_run_state(&t->state, &t->config);
+    malloc_run_state(&m->state, &m->config);
 }
 
-void free_transformer(Transformer* t) {
+void free_model(Mamba* m) {
     // close the memory mapping
-    if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
-    if (t->fd != -1) { close(t->fd); }
+    if (m->data != MAP_FAILED) { munmap(m->data, m->file_size); }
+    if (m->fd != -1) { close(m->fd); }
     // free the RunState buffers
-    free_run_state(&t->state);
+    free_run_state(&m->state);
 }
 
 // ----------------------------------------------------------------------------
-// neural net blocks; the dynamics of the Transformer
+// neural net blocks; the dynamics of the model
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
@@ -190,7 +202,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     ss = 1.0f / sqrtf(ss);
     // normalize and scale
     for (int j = 0; j < size; j++) {
-        o[j] = weight[j] * (ss * x[j]);
+        o[j] = x[j] * weight[j] * ss;
     }
 }
 
@@ -214,12 +226,48 @@ void softmax(float* x, int size) {
     }
 }
 
+float softplus(float x) {
+    return logf(1.0f + expf(x));
+}
+
+float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+float silu(float x) {
+    return x * sigmoid(x);
+}
+
+void shift_matrix_left(float* matrix, int rows, int cols) {
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols - 1; j++) {
+            matrix[i * cols + j] = matrix[i * cols + j + 1];
+        }
+    }
+}
+
+void update_last_column(float* matrix, float* x, int rows, int cols) {
+    for (int i = 0; i < rows; i++) {
+        matrix[i * cols + cols - 1] = x[i];
+    }
+}
+
+void rowwise_dot_product(float* out, float* matrix, float* weights, int rows, int cols) {
+    // matrix[rows,cols], weights[cols] -> out[rows]
+    // this is a dot product of each row of the matrix with the weights
+    // i.e. out[i] = matrix[i,:] @ weights
+    for (int i = 0; i < rows; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < cols; j++) {
+            val += matrix[i * cols + j] * weights[j];
+        }
+        out[i] = val;
+    }
+}
+
 void matmul(float* xout, float* x, float* w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
+    // w[d,n] @ x[n] -> xout[d]
+    for (int i = 0; i < d; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
             val += w[i * n + j] * x[j];
@@ -228,136 +276,177 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
-float* forward(Transformer* transformer, int token, int pos) {
+void linear(float* xout, float* x, float* w, float* b, int n, int d) {
+    // w[d,n] @ x[n] + b[d] -> xout[d]
+    for (int i = 0; i < d; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < n; j++) {
+            val += w[i * n + j] * x[j];
+        }
+        xout[i] = val + b[i];
+    }
+}
 
+void broadcast_multiply(float* out, float* x, float* y, int d, int n) {
+    // x[d], y[d,n] -> out[d,n]
+    for (int i = 0; i < d; i++) {
+        for (int j = 0; j < n; j++) {
+            int index = i * n + j;
+            out[index] = x[i] * y[index];
+            //out[i * n + j] = x[i] * y[i * n + j];
+        }
+    }
+}
+
+void inplace_add_scaled_vector(float* y, float* D, float* x, int d) {
+    for (int i = 0; i < d; i++) {
+        y[i] += D[i] * x[i];
+    }
+}
+
+void elementwise_multiply(float* result, float* matrix1, float* matrix2, int rows, int cols) {
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            int index = i * cols + j;
+            result[index] = matrix1[index] * matrix2[index];
+        }
+    }
+}
+
+void elementwise_multiply_and_add(float* ssm_state, float* dA, float* temp, int d, int n) {
+    for (int i = 0; i < d * n; i++) {
+        ssm_state[i] = ssm_state[i] * dA[i] + temp[i];
+    }
+}
+
+void outer_product(float* out, float* x, float* y, int d, int n) {
+    // x[d], y[n] -> out[d,n]
+    for (int i = 0; i < d; i++) {
+        for (int j = 0; j < n; j++) {
+            out[i * n + j] = x[i] * y[j];
+        }
+    }
+}
+
+void sum_along_last_dim(float* result, float* matrix, int rows, int cols) {
+    for (int i = 0; i < rows; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < cols; j++) {
+            val += matrix[i * cols + j];
+        }
+        result[i] = val;
+    }
+}
+
+void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
+    Config* p = &mamba->config;
+    MambaWeights* w = &mamba->weights;
+    RunState* s = &mamba->state;
+    int dim = p->dim, d_inner = p->d_inner, d_conv = p->d_conv, d_state = p->d_state, dt_rank = p->dt_rank;
+    float* dA = s->dA;  // (d_inner, d_state)
+    float* dB = s->dB;  // (d_inner, d_state)
+    float* y  = s->y;   // (d_inner)
+
+    // conv_state, ssm_state = self._get_states_from_cache(inference_params)
+    float* conv_state = s->conv_state + l * d_inner * d_conv;
+    float* ssm_state  = s->ssm_state  + l * d_inner * d_state;
+
+    // xz = self.in_proj(hidden_states)  # hidden_states: (dim), in_proj (2*d_inner, dim), xz (2*d_inner)
+    matmul(s->xz, hidden_state, w->in_proj + l * 2*d_inner*dim, dim, 2*d_inner);
+    // x, z = xz.chunk(2, dim=-1)
+    float* x = s->xz;            // x (d_inner)
+    float* z = s->xz + d_inner;  // z (d_inner)
+
+    // Conv step
+    // conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))   # Update state (d w)
+    shift_matrix_left(conv_state, d_inner, d_conv);
+    // conv_state[:, -1] = x
+    update_last_column(conv_state, x, d_inner, d_conv);
+    // x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (d)
+    elementwise_multiply(s->temp, conv_state, w->conv1d_weight + l*d_inner*d_conv, d_inner, d_conv);
+    sum_along_last_dim(x, s->temp, d_inner, d_conv);
+    // x = x + self.conv1d.bias
+    for (int i = 0; i < d_inner; i++) {
+        x[i] += w->conv1d_bias[l*d_inner + i];
+    }
+    // x = F.silu(x)
+    for (int i = 0; i < d_inner; i++) {
+        x[i] = silu(x[i]);
+    }
+
+    // SSM step
+    // x_db = self.x_proj(x)   # x_db (dt_rank+2*d_state)
+    matmul(s->x_db, x, w->x_proj + l*(dt_rank+2*d_state)*d_inner, d_inner, dt_rank+2*d_state);
+    // dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+    float *dt = s->x_db;                     // dt (dt_rank)
+    float *B = s->x_db + dt_rank;            // B  (d_state)
+    float *C = s->x_db + dt_rank + d_state;  // C  (d_state)
+
+    // dt = self.dt_proj(dt)   # dt (dt_rank), dt_proj_weight (d_inner, dt_rank), dt_proj_bias (d_inner)
+    linear(s->dt, dt, w->dt_proj_weight + l*d_inner*dt_rank, w->dt_proj_bias + l*d_inner, dt_rank, d_inner);
+    dt = s->dt;  // NOTE: dt is now bigger: (d_inner) instead of (dt_rank)
+    // dt = F.softplus(dt)
+    for (int i = 0; i < d_inner; i++) {
+        dt[i] = softplus(dt[i]);
+    }
+
+    // Discretize A and B
+    // dA = torch.exp(torch.einsum("d,dn->dn", dt, self.A))   # A (d_inner, d_state), dA (d_inner, d_state)
+    broadcast_multiply(dA, dt, w->A + l*d_inner*d_state, d_inner, d_state);
+    for (int i = 0; i < d_inner * d_state; i++) {
+        dA[i] = expf(dA[i]);
+    }
+    // dB = torch.einsum("d,n->dn", dt, B)    # dt (d_inner), B (d_state), dB (d_inner, d_state)
+    outer_product(dB, dt, B, d_inner, d_state);
+    // ssm_state.copy_(ssm_state * dA + rearrange(x, "d -> d 1") * dB)
+    broadcast_multiply(s->temp, x, dB, d_inner, d_state);
+    elementwise_multiply_and_add(ssm_state, dA, s->temp, d_inner, d_state);
+
+    // y = torch.einsum("dn,n->d", ssm_state, C) # ssm_state (d_inner, d_state), C (d_state), y (d_inner)
+    rowwise_dot_product(y, ssm_state, C, d_inner, d_state);
+    // y = y + self.D * x
+    inplace_add_scaled_vector(y, w->D + l*d_inner, x, d_inner);
+    // y = y * F.silu(z)  # (d_inner)
+    for (int i = 0; i < d_inner; i++) {
+        y[i] = y[i] * silu(z[i]);
+    }
+
+    // hidden_state = self.out_proj(y)  # out_proj (dim, d_inner), hidden_state (dim)
+    matmul(hidden_state, y, w->out_proj + l*dim*d_inner, d_inner, dim);
+}
+
+float* forward(Mamba* mamba, int token) {
     // a few convenience variables
-    Config* p = &transformer->config;
-    TransformerWeights* w = &transformer->weights;
-    RunState* s = &transformer->state;
-    float *x = s->x;
+    Config* p = &mamba->config;
+    MambaWeights* w = &mamba->weights;
+    RunState* s = &mamba->state;
     int dim = p->dim;
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
-    int hidden_dim =  p->hidden_dim;
-    int head_size = dim / p->n_heads;
+    float *input = s->input;
+    float *hidden_state = s->hidden_state;
 
     // copy the token embedding into x
     float* content_row = w->token_embedding_table + token * dim;
-    memcpy(x, content_row, dim*sizeof(*x));
+    memcpy(input, content_row, dim * sizeof(float));
 
     // forward all the layers
     for(unsigned long long l = 0; l < p->n_layers; l++) {
-
-        // attention rmsnorm
-        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
-
-        // key and value point to the kv cache
-        int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
-        s->k = s->key_cache + loff + pos * kv_dim;
-        s->v = s->value_cache + loff + pos * kv_dim;
-
-        // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
-
-        // RoPE relative positional encoding: complex-valued rotate q and k in each head
-        for (int i = 0; i < dim; i+=2) {
-            int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-            float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
-            int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-            for (int v = 0; v < rotn; v++) {
-                float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
-                float v0 = vec[i];
-                float v1 = vec[i+1];
-                vec[i]   = v0 * fcr - v1 * fci;
-                vec[i+1] = v0 * fci + v1 * fcr;
-            }
-        }
-
-        // multihead attention. iterate over all heads
-        int h;
-        #pragma omp parallel for private(h)
-        for (h = 0; h < p->n_heads; h++) {
-            // get the query vector for this head
-            float* q = s->q + h * head_size;
-            // attention scores for this head
-            float* att = s->att + h * p->seq_len;
-            // iterate over all timesteps, including the current one
-            for (int t = 0; t <= pos; t++) {
-                // get the key vector for this head and at this timestep
-                float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // calculate the attention score as the dot product of q and k
-                float score = 0.0f;
-                for (int i = 0; i < head_size; i++) {
-                    score += q[i] * k[i];
-                }
-                score /= sqrtf(head_size);
-                // save the score to the attention buffer
-                att[t] = score;
-            }
-
-            // softmax the scores to get attention weights, from 0..pos inclusively
-            softmax(att, pos + 1);
-
-            // weighted sum of the values, store back into xb
-            float* xb = s->xb + h * head_size;
-            memset(xb, 0, head_size * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
-                // get the value vector for this head and at this timestep
-                float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // get the attention weight for this timestep
-                float a = att[t];
-                // accumulate the weighted value into xb
-                for (int i = 0; i < head_size; i++) {
-                    xb[i] += a * v[i];
-                }
-            }
-        }
-
-        // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
-
-        // residual connection back into x
+        // normalize the input
+        rmsnorm(hidden_state, input, w->norm + l * dim, dim);
+        // forward this layer
+        forward_layer(mamba, l, hidden_state);
+        // residual connection back into hidden_state
         for (int i = 0; i < dim; i++) {
-            x[i] += s->xb2[i];
-        }
-
-        // ffn rmsnorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
-
-        // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-        // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
-
-        // SwiGLU non-linearity
-        for (int i = 0; i < hidden_dim; i++) {
-            float val = s->hb[i];
-            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            val *= (1.0f / (1.0f + expf(-val)));
-            // elementwise multiply with w3(x)
-            val *= s->hb2[i];
-            s->hb[i] = val;
-        }
-
-        // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
-
-        // residual connection
-        for (int i = 0; i < dim; i++) {
-            x[i] += s->xb[i];
+            hidden_state[i] += input[i];
+            // copy hidden_state back into input for the next layer
+            input[i] = hidden_state[i];
         }
     }
 
     // final rmsnorm
-    rmsnorm(x, x, w->rms_final_weight, dim);
+    rmsnorm(hidden_state, hidden_state, w->final_norm, dim);
 
     // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    matmul(s->logits, hidden_state, w->lm_head, p->dim, p->rounded_vocab_size);
     return s->logits;
 }
 
@@ -726,7 +815,7 @@ long time_in_ms() {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
+void generate(Mamba *mamba, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
@@ -746,8 +835,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     int pos = 0;     // position in the sequence
     while (pos < steps) {
 
-        // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
+        // forward the model to get logits for the next token
+        float* logits = forward(mamba, token);
 
         // advance the state machine
         if (pos < num_prompt_tokens - 1) {
@@ -799,7 +888,7 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 // python reference and that seemed ok, but this was not thoroughly tested and
 // is not safely implemented, it's more a proof of concept atm.
 
-void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
+void chat(Mamba *mamba, Tokenizer *tokenizer, Sampler *sampler,
           char *cli_user_prompt, char *cli_system_prompt, int steps) {
 
     // buffers for reading the system prompt and user prompt from stdin
@@ -814,7 +903,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     // start the main loop
     int8_t user_turn = 1; // user starts
     int next;        // will store the next token in the sequence
-    int token;       // stores the current token to feed into the transformer
+    int token;       // stores the current token to feed into the model
     int prev_token;
     int pos = 0;     // position in the sequence
     while (pos < steps) {
@@ -855,7 +944,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
             printf("Assistant: ");
         }
 
-        // determine the token to pass into the transformer next
+        // determine the token to pass into the model next
         if (user_idx < num_prompt_tokens) {
             // if we are still processing the input prompt, force the next prompt token
             token = prompt_tokens[user_idx++];
@@ -866,8 +955,8 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
         // EOS (=2) token ends the Assistant turn
         if (token == 2) { user_turn = 1; }
 
-        // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
+        // forward the model to get logits for the next token
+        float* logits = forward(mamba, token);
         next = sample(sampler, logits);
         pos++;
 
@@ -895,7 +984,7 @@ void error_usage() {
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
-    fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
+    fprintf(stderr, "  -n <int>    number of steps to run for, default 256\n");
     fprintf(stderr, "  -i <string> input prompt\n");
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
@@ -906,7 +995,7 @@ void error_usage() {
 int main(int argc, char *argv[]) {
 
     // default parameters
-    char *checkpoint_path = NULL;  // e.g. out/model.bin
+    char *model_path = NULL;    // e.g. out/model.bin
     char *tokenizer_path = "tokenizer.bin";
     float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
@@ -917,7 +1006,7 @@ int main(int argc, char *argv[]) {
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
 
     // poor man's C argparse so we can override the defaults above from the command line
-    if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
+    if (argc >= 2) { model_path = argv[1]; } else { error_usage(); }
     for (int i = 2; i < argc; i+=2) {
         // do some basic validation
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
@@ -941,24 +1030,29 @@ int main(int argc, char *argv[]) {
     if (topp < 0.0 || 1.0 < topp) topp = 0.9;
     if (steps < 0) steps = 0;
 
-    // build the Transformer via the model .bin file
-    Transformer transformer;
-    build_transformer(&transformer, checkpoint_path);
-    if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
+    // load the model using the model.bin file
+    Mamba mamba;
+    load_model(&mamba, model_path);
+
+    // print the config
+    fprintf(stderr, "config: vocab_size=%d (%d), n_layers=%d, dim=%d, d_inner=%d, dt_rank=%d, d_state=%d, d_conv=%d\n",
+            mamba.config.vocab_size, mamba.config.rounded_vocab_size, mamba.config.n_layers, mamba.config.dim, mamba.config.d_inner, mamba.config.dt_rank, mamba.config.d_state, mamba.config.d_conv);
+
+    if (steps == 0) steps = 256; // override to default len if 0
 
     // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer;
-    build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+    build_tokenizer(&tokenizer, tokenizer_path, mamba.config.vocab_size);
 
     // build the Sampler
     Sampler sampler;
-    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
+    build_sampler(&sampler, mamba.config.vocab_size, temperature, topp, rng_seed);
 
     // run!
     if (strcmp(mode, "generate") == 0) {
-        generate(&transformer, &tokenizer, &sampler, prompt, steps);
+        generate(&mamba, &tokenizer, &sampler, prompt, steps);
     } else if (strcmp(mode, "chat") == 0) {
-        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+        chat(&mamba, &tokenizer, &sampler, prompt, system_prompt, steps);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();
@@ -967,7 +1061,7 @@ int main(int argc, char *argv[]) {
     // memory and file handles cleanup
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
-    free_transformer(&transformer);
+    free_model(&mamba);
     return 0;
 }
 #endif

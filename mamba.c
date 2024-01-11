@@ -839,6 +839,13 @@ void generate(Mamba *mamba, Tokenizer *tokenizer, Sampler *sampler, char *prompt
         exit(EXIT_FAILURE);
     }
 
+    // print the first token in the prompt
+    if (num_prompt_tokens > 1) {
+        char* piece = decode(tokenizer, EOS, prompt_tokens[0]);
+        safe_printf(piece);
+        fflush(stdout);
+    }
+
     // start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence

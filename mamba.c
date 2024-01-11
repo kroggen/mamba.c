@@ -978,13 +978,13 @@ void chat(Mamba *mamba, Tokenizer *tokenizer, Sampler *sampler,
         next = sample(sampler, logits);
         pos++;
 
-        if (user_idx >= num_prompt_tokens && next != 2) {
+        if (user_idx >= num_prompt_tokens && next != EOS) {
             // the Assistant is responding, so print its output
             char* piece = decode(tokenizer, token, next);
             safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
             fflush(stdout);
         }
-        if (next == 2) { printf("\n"); }
+        if (next == EOS) { printf("\n"); }
     }
     printf("\n");
     free(prompt_tokens);

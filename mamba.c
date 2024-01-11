@@ -77,16 +77,16 @@ typedef struct {
 
 void malloc_run_state(RunState* s, Config* p) {
     // memory reused by all layers
-    s->input = calloc(p->dim, sizeof(float));
-    s->hidden_state = calloc(p->dim, sizeof(float));
-    s->xz = calloc(2 * p->d_inner, sizeof(float));
-    s->x_db = calloc(p->dt_rank + 2 * p->d_state, sizeof(float));
-    s->dt = calloc(p->d_inner, sizeof(float));
-    s->dA = calloc(p->d_inner * p->d_state, sizeof(float));
-    s->dB = calloc(p->d_inner * p->d_state, sizeof(float));
-    s->temp = calloc(p->d_inner * p->d_state, sizeof(float));
-    s->y = calloc(p->d_inner, sizeof(float));
-    s->logits = calloc(p->rounded_vocab_size, sizeof(float));
+    s->input = malloc(p->dim * sizeof(float));
+    s->hidden_state = malloc(p->dim * sizeof(float));
+    s->xz = malloc(2 * p->d_inner * sizeof(float));
+    s->x_db = malloc(p->dt_rank + 2 * p->d_state * sizeof(float));
+    s->dt = malloc(p->d_inner * sizeof(float));
+    s->dA = malloc(p->d_inner * p->d_state * sizeof(float));
+    s->dB = malloc(p->d_inner * p->d_state * sizeof(float));
+    s->temp = malloc(p->d_inner * p->d_state * sizeof(float));
+    s->y = malloc(p->d_inner * sizeof(float));
+    s->logits = malloc(p->rounded_vocab_size * sizeof(float));
     // internal state, separate memory for each layer
     s->conv_state = calloc(p->n_layers * p->d_inner * p->d_conv, sizeof(float));
     s->ssm_state = calloc(p->n_layers * p->d_inner * p->d_state, sizeof(float));

@@ -453,6 +453,9 @@ float* forward(Mamba* mamba, int token) {
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
+#define BOS 0
+#define EOS 0
+
 typedef struct {
     char *str;
     int id;
@@ -516,8 +519,8 @@ void free_tokenizer(Tokenizer* t) {
 
 char* decode(Tokenizer* t, int prev_token, int token) {
     char *piece = t->vocab[token];
-    // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
-    if (prev_token == 1 && piece[0] == ' ') { piece++; }
+    // discard initial space if prev_token was EOS
+    if (prev_token == EOS && piece[0] == ' ') { piece++; }
     // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
     // parse this and convert and return the actual byte
     unsigned char byte_val;
@@ -548,9 +551,9 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     return res != NULL ? res->id : -1;
 }
 
-void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
+void encode(Tokenizer* t, char *text, int8_t add_bos, int8_t add_eos, int *tokens, int *n_tokens) {
     // encode the string text (input) into an upper-bound preallocated tokens[] array
-    // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
+    // add_bos != 0 means prepend the BOS token, add_eos != 0 means append the EOS token
     if (text == NULL) { fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE); }
 
     if (t->sorted_vocab == NULL) {
@@ -571,14 +574,13 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     // start at 0 tokens
     *n_tokens = 0;
 
-    // add optional BOS (=1) token, if desired
-    if (bos) tokens[(*n_tokens)++] = 1;
+    // add optional BOS token, if desired
+    if (add_bos) tokens[(*n_tokens)++] = BOS;
 
-    // add_dummy_prefix is true by default
-    // so prepend a dummy prefix token to the input string, but only if text != ""
-    // TODO: pretty sure this isn't correct in the general case but I don't have the
-    // energy to read more of the sentencepiece code to figure out what it's doing
-    if (text[0] != '\0') {
+    // add_dummy_prefix is not used in Mamba, but it's here for reference
+    // prepend a dummy prefix token to the input string, but only if text != ""
+    int add_dummy_prefix = 0;
+    if (add_dummy_prefix && text[0] != '\0') {
         int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
         tokens[(*n_tokens)++] = dummy_prefix;
     }
@@ -662,8 +664,8 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         (*n_tokens)--; // token length decreased
     }
 
-    // add optional EOS (=2) token, if desired
-    if (eos) tokens[(*n_tokens)++] = 2;
+    // add optional EOS token, if desired
+    if (add_eos) tokens[(*n_tokens)++] = EOS;
 
     free(str_buffer);
 }
@@ -830,8 +832,8 @@ void generate(Mamba *mamba, Tokenizer *tokenizer, Sampler *sampler, char *prompt
 
     // encode the (string) prompt into tokens sequence
     int num_prompt_tokens = 0;
-    int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
-    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+    int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', BOS, EOS
+    encode(tokenizer, prompt, 0, 0, prompt_tokens, &num_prompt_tokens);
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);
@@ -857,8 +859,8 @@ void generate(Mamba *mamba, Tokenizer *tokenizer, Sampler *sampler, char *prompt
         }
         pos++;
 
-        // data-dependent terminating condition: the BOS (=1) token delimits sequences
-        if (next == 1) { break; }
+        // data-dependent terminating condition: the EOS token delimits sequences
+        if (next == EOS) { break; }
 
         // print the token as string, decode it with the Tokenizer object
         char* piece = decode(tokenizer, token, next);
@@ -947,7 +949,7 @@ void chat(Mamba *mamba, Tokenizer *tokenizer, Sampler *sampler,
                 sprintf(rendered_prompt, user_template, user_prompt);
             }
             // encode the rendered prompt into tokens
-            encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+            encode(tokenizer, rendered_prompt, 0, 0, prompt_tokens, &num_prompt_tokens);
             user_idx = 0; // reset the user index
             user_turn = 0;
             printf("Assistant: ");
@@ -961,8 +963,8 @@ void chat(Mamba *mamba, Tokenizer *tokenizer, Sampler *sampler,
             // otherwise use the next token sampled from previous turn
             token = next;
         }
-        // EOS (=2) token ends the Assistant turn
-        if (token == 2) { user_turn = 1; }
+        // EOS token ends the Assistant turn
+        if (token == EOS) { user_turn = 1; }
 
         // forward the model to get logits for the next token
         float* logits = forward(mamba, token);

@@ -304,18 +304,21 @@ void inplace_add_scaled_vector(float* y, float* D, float* x, int d) {
     }
 }
 
-void elementwise_multiply(float* result, float* matrix1, float* matrix2, int rows, int cols) {
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < cols; j++) {
-            int index = i * cols + j;
-            result[index] = matrix1[index] * matrix2[index];
-        }
+void elementwise_multiply(float* result, float* matrix1, float* matrix2, int total_elements) {
+    for (int i = 0; i < total_elements; i++) {
+        result[i] = matrix1[i] * matrix2[i];
     }
 }
 
-void elementwise_multiply_and_add(float* ssm_state, float* dA, float* temp, int d, int n) {
-    for (int i = 0; i < d * n; i++) {
-        ssm_state[i] = ssm_state[i] * dA[i] + temp[i];
+void elementwise_add(float* result, float* matrix1, float* matrix2, int total_elements) {
+    for (int i = 0; i < total_elements; i++) {
+        result[i] = matrix1[i] + matrix2[i];
+    }
+}
+
+void elementwise_multiply_and_add(float* result, float* matrix1, float* matrix2, float* matrix3, int total_elements) {
+    for (int i = 0; i < total_elements; i++) {
+        result[i] = matrix1[i] * matrix2[i] + matrix3[i];
     }
 }
 
@@ -363,12 +366,10 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     // conv_state[:, -1] = x
     update_last_column(conv_state, x, d_inner, d_conv);
     // x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (d)
-    elementwise_multiply(s->temp, conv_state, w->conv1d_weight + l*d_inner*d_conv, d_inner, d_conv);
+    elementwise_multiply(s->temp, conv_state, w->conv1d_weight + l*d_inner*d_conv, d_inner * d_conv);
     sum_along_last_dim(x, s->temp, d_inner, d_conv);
     // x = x + self.conv1d.bias
-    for (int i = 0; i < d_inner; i++) {
-        x[i] += w->conv1d_bias[l*d_inner + i];
-    }
+    elementwise_add(x, x, w->conv1d_bias + l*d_inner, d_inner);
     // x = F.silu(x)
     for (int i = 0; i < d_inner; i++) {
         x[i] = silu(x[i]);
@@ -400,7 +401,7 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     outer_product(dB, dt, B, d_inner, d_state);
     // ssm_state.copy_(ssm_state * dA + rearrange(x, "d -> d 1") * dB)
     broadcast_multiply(s->temp, x, dB, d_inner, d_state);
-    elementwise_multiply_and_add(ssm_state, dA, s->temp, d_inner, d_state);
+    elementwise_multiply_and_add(ssm_state, ssm_state, dA, s->temp, d_inner * d_state);
 
     // y = torch.einsum("dn,n->d", ssm_state, C) # ssm_state (d_inner, d_state), C (d_state), y (d_inner)
     rowwise_dot_product(y, ssm_state, C, d_inner, d_state);

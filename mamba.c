@@ -80,7 +80,7 @@ void malloc_run_state(RunState* s, Config* p) {
     s->input = malloc(p->dim * sizeof(float));
     s->hidden_state = malloc(p->dim * sizeof(float));
     s->xz = malloc(2 * p->d_inner * sizeof(float));
-    s->x_db = malloc(p->dt_rank + 2 * p->d_state * sizeof(float));
+    s->x_db = malloc((p->dt_rank + 2 * p->d_state) * sizeof(float));
     s->dt = malloc(p->d_inner * sizeof(float));
     s->dA = malloc(p->d_inner * p->d_state * sizeof(float));
     s->dB = malloc(p->d_inner * p->d_state * sizeof(float));

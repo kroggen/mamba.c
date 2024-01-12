@@ -298,12 +298,6 @@ void broadcast_multiply(float* out, float* x, float* y, int d, int n) {
     }
 }
 
-void inplace_add_scaled_vector(float* y, float* D, float* x, int d) {
-    for (int i = 0; i < d; i++) {
-        y[i] += D[i] * x[i];
-    }
-}
-
 void elementwise_multiply(float* result, float* matrix1, float* matrix2, int total_elements) {
     for (int i = 0; i < total_elements; i++) {
         result[i] = matrix1[i] * matrix2[i];
@@ -406,7 +400,7 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     // y = torch.einsum("dn,n->d", ssm_state, C) # ssm_state (d_inner, d_state), C (d_state), y (d_inner)
     rowwise_dot_product(y, ssm_state, C, d_inner, d_state);
     // y = y + self.D * x
-    inplace_add_scaled_vector(y, w->D + l*d_inner, x, d_inner);
+    elementwise_multiply_and_add(y, w->D + l*d_inner, x, y, d_inner);
     // y = y * F.silu(z)  # (d_inner)
     for (int i = 0; i < d_inner; i++) {
         y[i] = y[i] * silu(z[i]);

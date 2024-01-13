@@ -265,7 +265,7 @@ void rowwise_dot_product(float* out, float* matrix, float* weights, int rows, in
     }
 }
 
-void matmul(float* xout, float* x, float* w, int n, int d) {
+void matmul(float* xout, float* x, float* w, int d, int n) {
     // w[d,n] @ x[n] -> xout[d]
     for (int i = 0; i < d; i++) {
         float val = 0.0f;
@@ -276,7 +276,7 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
-void linear(float* xout, float* x, float* w, float* b, int n, int d) {
+void linear(float* xout, float* x, float* w, float* b, int d, int n) {
     // w[d,n] @ x[n] + b[d] -> xout[d]
     for (int i = 0; i < d; i++) {
         float val = 0.0f;
@@ -349,7 +349,7 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     float* ssm_state  = s->ssm_state  + l * d_inner * d_state;
 
     // xz = self.in_proj(hidden_states)  # hidden_states: (dim), in_proj (2*d_inner, dim), xz (2*d_inner)
-    matmul(s->xz, hidden_state, w->in_proj + l * 2*d_inner*dim, dim, 2*d_inner);
+    matmul(s->xz, hidden_state, w->in_proj + l * 2*d_inner*dim, 2*d_inner, dim);
     // x, z = xz.chunk(2, dim=-1)
     float* x = s->xz;            // x (d_inner)
     float* z = s->xz + d_inner;  // z (d_inner)
@@ -371,14 +371,14 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
 
     // SSM step
     // x_db = self.x_proj(x)   # x_db (dt_rank+2*d_state)
-    matmul(s->x_db, x, w->x_proj + l*(dt_rank+2*d_state)*d_inner, d_inner, dt_rank+2*d_state);
+    matmul(s->x_db, x, w->x_proj + l*(dt_rank+2*d_state)*d_inner, dt_rank+2*d_state, d_inner);
     // dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
     float *dt = s->x_db;                     // dt (dt_rank)
     float *B = s->x_db + dt_rank;            // B  (d_state)
     float *C = s->x_db + dt_rank + d_state;  // C  (d_state)
 
     // dt = self.dt_proj(dt)   # dt (dt_rank), dt_proj_weight (d_inner, dt_rank), dt_proj_bias (d_inner)
-    linear(s->dt, dt, w->dt_proj_weight + l*d_inner*dt_rank, w->dt_proj_bias + l*d_inner, dt_rank, d_inner);
+    linear(s->dt, dt, w->dt_proj_weight + l*d_inner*dt_rank, w->dt_proj_bias + l*d_inner, d_inner, dt_rank);
     dt = s->dt;  // NOTE: dt is now bigger: (d_inner) instead of (dt_rank)
     // dt = F.softplus(dt)
     for (int i = 0; i < d_inner; i++) {
@@ -407,7 +407,7 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     }
 
     // hidden_state = self.out_proj(y)  # out_proj (dim, d_inner), hidden_state (dim)
-    matmul(hidden_state, y, w->out_proj + l*dim*d_inner, d_inner, dim);
+    matmul(hidden_state, y, w->out_proj + l*dim*d_inner, dim, d_inner);
 }
 
 float* forward(Mamba* mamba, int token) {
@@ -441,7 +441,7 @@ float* forward(Mamba* mamba, int token) {
     rmsnorm(hidden_state, hidden_state, w->final_norm, dim);
 
     // classifier into logits
-    matmul(s->logits, hidden_state, w->lm_head, p->dim, p->rounded_vocab_size);
+    matmul(s->logits, hidden_state, w->lm_head, p->rounded_vocab_size, p->dim);
     return s->logits;
 }
 

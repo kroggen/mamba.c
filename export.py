@@ -147,17 +147,41 @@ def load_model(path):
     return model, config
 
 
+def get_model_from_huggingface(model_name: str):
+    """Download model from HuggingFace and get the path to the model file.
+    The model name can be one of the following:
+        'state-spaces/mamba-130m'
+        'state-spaces/mamba-370m'
+        'state-spaces/mamba-790m'
+        'state-spaces/mamba-1.4b'
+        'state-spaces/mamba-2.8b'
+        'state-spaces/mamba-2.8b-slimpj'
+    """
+    from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
+    from transformers.utils.hub import cached_file
+
+    config_path = cached_file(model_name, CONFIG_NAME, _raise_exceptions_for_missing_entries=False)
+    model_path = cached_file(model_name, WEIGHTS_NAME, _raise_exceptions_for_missing_entries=False)
+
+    return model_path
+
 # -----------------------------------------------------------------------------
 # CLI entrypoint
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("source", type=str, help="folder where the pytorch_model.bin file is located", default=".")
-    parser.add_argument("destination", type=str, help="full path to the output file")
+    parser.add_argument("source", type=str, help="model name or folder where the model files are located", default="state-spaces/mamba-130m")
+    parser.add_argument("destination", type=str, help="full path to the output file", default="model.bin")
     args = parser.parse_args()
 
-    model, config = load_model(args.source)
+    # if the source starts with 'state-spaces/mamba-' then load the model from HuggingFace
+    if args.source.startswith('state-spaces/mamba-'):
+        model_path = get_model_from_huggingface(args.source)
+    else:
+        model_path = args.source
+
+    model, config = load_model(model_path)
 
     if model is None:
         parser.error("Can't load input model!")

@@ -1,20 +1,22 @@
 # mamba.c
 
 <p align="center">
-  <img src="assets/cute-mamba.png" width="300" height="300" alt="Cute Mamba">
+  <img src="assets/mamba-c.png" width="300" height="300" alt="Mamba C">
 </p>
+
+<p align="right"><a href="https://github.com/kroggen/mamba.c/blob/learning/README-zh.md">中文</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ja.md">日本語</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ru.md">Русский</a></p>
 
 Inference of Mamba models in pure C
 
-Inspired and using code from [llama2.c](https://github.com/karpathy/llama2.c)
+Inspired by and using code from [llama2.c](https://github.com/karpathy/llama2.c)
 
 This implements only the recurrent mode of Mamba SSM
 
-You can compare it with the [related pytorch impementation](https://github.com/kroggen/mamba-cpu/tree/recurrent-only)
+You can compare it with the [related pytorch implementation](https://github.com/kroggen/mamba-cpu/tree/recurrent-only)
 
 No support for batches. The code is minimal for learning purposes.
 
-Even so, it is way faster than pytorch on CPU!!!
+Even so, it is faster than pytorch on CPU!!!
 
 
 ## Fast Start
@@ -66,6 +68,16 @@ To set the internal state:
 ```c
   set_internal_state(mamba, state, state_size);
 ```
+
+
+## Branches
+
+There are mainly 2 branches:
+
+* `learning` - very basic
+* `fused` - fuse the basic functions into bigger ones
+
+You can [compare](https://github.com/kroggen/mamba.c/compare/learning..fused) them
 
 
 ## Notes

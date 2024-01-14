@@ -363,6 +363,26 @@ void sum_along_last_dim(float* result, float* matrix, int rows, int cols) {
     }
 }
 
+void ssm(float* y, float* ssm_state, float* dt, float* A, float* B, float* C, float* D,
+         float* x, float* z, int d_inner, int d_state) {
+    #pragma omp parallel for
+    for (int i = 0; i < d_inner; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < d_state; j++) {
+            int index = i * d_state + j;
+            // discretize A and B
+            float dA = expf(dt[i] * A[index]);
+            float dB = dt[i] * B[j];
+            // update ssm_state
+            ssm_state[index] = ssm_state[index] * dA + x[i] * dB;
+            // accumulate to compute y
+            val += ssm_state[index] * C[j];
+        }
+        val += D[i] * x[i];
+        y[i] = val * silu(z[i]);
+    }
+}
+
 void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     Config* p = &mamba->config;
     MambaWeights* w = &mamba->weights;
@@ -413,26 +433,16 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
         dt[i] = softplus(dt[i]);
     }
 
-    // Discretize A and B
+    //  Discretize A and B
     // dA = torch.exp(torch.einsum("d,dn->dn", dt, self.A))   # A (d_inner, d_state), dA (d_inner, d_state)
-    broadcast_multiply(dA, dt, w->A + l*d_inner*d_state, d_inner, d_state);
-    for (int i = 0; i < d_inner * d_state; i++) {
-        dA[i] = expf(dA[i]);
-    }
     // dB = torch.einsum("d,n->dn", dt, B)    # dt (d_inner), B (d_state), dB (d_inner, d_state)
-    outer_product(dB, dt, B, d_inner, d_state);
+    //  Update ssm_state
     // ssm_state.copy_(ssm_state * dA + rearrange(x, "d -> d 1") * dB)
-    broadcast_multiply(s->temp, x, dB, d_inner, d_state);
-    elementwise_multiply_and_add(ssm_state, ssm_state, dA, s->temp, d_inner * d_state);
-
+    //  Compute y
     // y = torch.einsum("dn,n->d", ssm_state, C) # ssm_state (d_inner, d_state), C (d_state), y (d_inner)
-    rowwise_dot_product(y, ssm_state, C, d_inner, d_state);
     // y = y + self.D * x
-    elementwise_multiply_and_add(y, w->D + l*d_inner, x, y, d_inner);
     // y = y * F.silu(z)  # (d_inner)
-    for (int i = 0; i < d_inner; i++) {
-        y[i] = y[i] * silu(z[i]);
-    }
+    ssm(y, ssm_state, dt, w->A + l*d_inner*d_state, B, C, w->D + l*d_inner, x, z, d_inner, d_state);
 
     // hidden_state = self.out_proj(y)  # out_proj (dim, d_inner), hidden_state (dim)
     matmul(hidden_state, y, w->out_proj + l*dim*d_inner, dim, d_inner);

@@ -68,6 +68,16 @@ To set the internal state:
 ```
 
 
+## Branches
+
+There are mainly 2 branches:
+
+* `learning` - very basic
+* `fused` - fuse the basic functions into bigger ones
+
+You can [compare](https://github.com/kroggen/mamba.c/compare/learning...fused) them
+
+
 ## Notes
 
 The tokenizer may need some more work for special characters

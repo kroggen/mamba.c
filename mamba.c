@@ -407,8 +407,8 @@ void sum_along_last_dim(float* result, float* matrix, int rows, int cols) {
     }
 }
 
-void ssm(float* y, float* ssm_state, float* dt, float* A, float* B, float* C, float* D,
-         float* x, float* z, int d_inner, int d_state) {
+void selective_scan(float* y, float* ssm_state, float* dt, float* A, float* B, float* C, float* D,
+                    float* x, float* z, int d_inner, int d_state) {
     #pragma omp parallel for
     for (int i = 0; i < d_inner; i++) {
         float val = 0.0f;
@@ -444,7 +444,9 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     float* x = s->xz;            // x (d_inner)
     float* z = s->xz + d_inner;  // z (d_inner)
 
+
     // Conv step
+
     // conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
     shift_matrix_left(conv_state, d_inner, d_conv);
     // conv_state[:, -1] = x
@@ -458,6 +460,7 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
 
 
     // SSM step
+
     // x_db = self.x_proj(x)   # x_db (dt_rank+2*d_state)
     matmul(s->x_db, x, w->x_proj + l*(dt_rank+2*d_state)*d_inner, dt_rank+2*d_state, d_inner);
     // dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
@@ -479,7 +482,7 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     // y = torch.einsum("dn,n->d", ssm_state, C) # ssm_state (d_inner, d_state), C (d_state), y (d_inner)
     // y = y + self.D * x
     // y = y * F.silu(z)  # (d_inner)
-    ssm(y, ssm_state, dt, w->A + l*d_inner*d_state, B, C, w->D + l*d_inner, x, z, d_inner, d_state);
+    selective_scan(y, ssm_state, dt, w->A + l*d_inner*d_state, B, C, w->D + l*d_inner, x, z, d_inner, d_state);
 
     // hidden_state = self.out_proj(y)  # out_proj (dim, d_inner), hidden_state (dim)
     matmul(hidden_state, y, w->out_proj + l*dim*d_inner, dim, d_inner);

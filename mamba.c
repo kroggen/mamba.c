@@ -55,9 +55,6 @@ typedef struct {
     float *xz;     // (2*d_inner)          x and z are pointers into this buffer
     float *x_db;   // (dt_rank+2*d_state)  dt, B, C are pointers into this buffer
     float *dt;     // (d_inner)            later, dt is a pointer to this buffer
-    float *dA;     // (d_inner, d_state)
-    float *dB;     // (d_inner, d_state)
-    float *temp;   // (d_inner, d_state)
     float *y;      // (d_inner)
     float *logits; // (rounded_vocab_size)
     // internal state, separate memory for each layer
@@ -82,16 +79,13 @@ void malloc_run_state(RunState* s, Config* p) {
     s->xz = malloc(2 * p->d_inner * sizeof(float));
     s->x_db = malloc((p->dt_rank + 2 * p->d_state) * sizeof(float));
     s->dt = malloc(p->d_inner * sizeof(float));
-    s->dA = malloc(p->d_inner * p->d_state * sizeof(float));
-    s->dB = malloc(p->d_inner * p->d_state * sizeof(float));
-    s->temp = malloc(p->d_inner * p->d_state * sizeof(float));
     s->y = malloc(p->d_inner * sizeof(float));
     s->logits = malloc(p->rounded_vocab_size * sizeof(float));
     // internal state, separate memory for each layer
     s->conv_state = calloc(p->n_layers * p->d_inner * p->d_conv, sizeof(float));
     s->ssm_state = calloc(p->n_layers * p->d_inner * p->d_state, sizeof(float));
     // ensure all mallocs went fine
-    if (!s->xz || !s->x_db || !s->dt || !s->dA || !s->dB || !s->temp || !s->y
+    if (!s->xz || !s->x_db || !s->dt || !s->y
      || !s->logits || !s->conv_state || !s->ssm_state) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
@@ -140,9 +134,6 @@ void free_run_state(RunState* s) {
     free(s->xz);
     free(s->x_db);
     free(s->dt);
-    free(s->dA);
-    free(s->dB);
-    free(s->temp);
     free(s->y);
     free(s->logits);
     free(s->conv_state);
@@ -429,8 +420,6 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     MambaWeights* w = &mamba->weights;
     RunState* s = &mamba->state;
     int dim = p->dim, d_inner = p->d_inner, d_conv = p->d_conv, d_state = p->d_state, dt_rank = p->dt_rank;
-    float* dA = s->dA;  // (d_inner, d_state)
-    float* dB = s->dB;  // (d_inner, d_state)
     float* y  = s->y;   // (d_inner)
 
     // conv_state, ssm_state = self._get_states_from_cache(inference_params)

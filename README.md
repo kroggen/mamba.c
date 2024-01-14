@@ -1,4 +1,4 @@
-# Mamba C
+# mamba.c
 
 <p align="center">
   <img src="assets/cute-mamba.png" width="300" height="300" alt="Cute Mamba">

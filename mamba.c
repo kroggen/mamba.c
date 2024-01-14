@@ -106,6 +106,34 @@ void reset_internal_state(Mamba* mamba) {
     memset(s->ssm_state, 0, p->n_layers * p->d_inner * p->d_state * sizeof(float));
 }
 
+char* get_internal_state(Mamba* mamba, int* state_size) {
+    // get the internal state of the model
+    Config* p = &mamba->config;
+    RunState* s = &mamba->state;
+    unsigned int conv_state_size = p->n_layers * p->d_inner * p->d_conv * sizeof(float);
+    unsigned int ssm_state_size = p->n_layers * p->d_inner * p->d_state * sizeof(float);
+    unsigned int total_size = conv_state_size + ssm_state_size;
+    char* state = malloc(total_size);
+    if (state) {
+        memcpy(state, s->conv_state, conv_state_size);
+        memcpy(state + conv_state_size, s->ssm_state, ssm_state_size);
+        *state_size = total_size;
+    }
+    return state;
+}
+
+void set_internal_state(Mamba* mamba, char* state, int state_size) {
+    // set the internal state of the model
+    Config* p = &mamba->config;
+    RunState* s = &mamba->state;
+    unsigned int conv_state_size = p->n_layers * p->d_inner * p->d_conv * sizeof(float);
+    unsigned int ssm_state_size = p->n_layers * p->d_inner * p->d_state * sizeof(float);
+    if (state_size == conv_state_size + ssm_state_size) {
+        memcpy(s->conv_state, state, conv_state_size);
+        memcpy(s->ssm_state, state + conv_state_size, ssm_state_size);
+    }
+}
+
 void free_run_state(RunState* s) {
     free(s->input);
     free(s->hidden_state);

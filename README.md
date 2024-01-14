@@ -4,9 +4,11 @@
   <img src="assets/cute-mamba.png" width="300" height="300" alt="Cute Mamba">
 </p>
 
+<p align="right"><a href="https://github.com/kroggen/mamba.c/blob/learning/README-zh.md">中文</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ja.md">日本語</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ru.md">Русский</a></p>
+
 Inference of Mamba models in pure C
 
-Inspired and using code from [llama2.c](https://github.com/karpathy/llama2.c)
+Inspired by and using code from [llama2.c](https://github.com/karpathy/llama2.c)
 
 This implements only the recurrent mode of Mamba SSM
 
@@ -14,7 +16,7 @@ You can compare it with the [related pytorch impementation](https://github.com/k
 
 No support for batches. The code is minimal for learning purposes.
 
-Even so, it is way faster than pytorch on CPU!!!
+Even so, it is faster than pytorch on CPU!!!
 
 
 ## Fast Start

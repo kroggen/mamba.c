@@ -343,6 +343,19 @@ void linear(float* xout, float* x, float* w, float* b, int d, int n) {
     }
 }
 
+void dense_softplus(float* xout, float* x, float* w, float* b, int d, int n) {
+    // w[d,n] @ x[n] + b[d] -> xout[d]
+    // xout[i] = softplus(w[i,:] @ x + b[i])
+    #pragma omp parallel for
+    for (int i = 0; i < d; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < n; j++) {
+            val += w[i * n + j] * x[j];
+        }
+        xout[i] = softplus(val + b[i]);
+    }
+}
+
 void broadcast_multiply(float* out, float* x, float* y, int d, int n) {
     // x[d], y[d,n] -> out[d,n]
     for (int i = 0; i < d; i++) {
@@ -452,12 +465,9 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     float *C = s->x_db + dt_rank + d_state;  // C  (d_state)
 
     // dt = self.dt_proj(dt)   # dt (dt_rank), dt_proj_weight (d_inner, dt_rank), dt_proj_bias (d_inner)
-    linear(s->dt, dt, w->dt_proj_weight + l*d_inner*dt_rank, w->dt_proj_bias + l*d_inner, d_inner, dt_rank);
-    dt = s->dt;  // NOTE: dt is now bigger: (d_inner) instead of (dt_rank)
     // dt = F.softplus(dt)
-    for (int i = 0; i < d_inner; i++) {
-        dt[i] = softplus(dt[i]);
-    }
+    dense_softplus(s->dt, dt, w->dt_proj_weight + l*d_inner*dt_rank, w->dt_proj_bias + l*d_inner, d_inner, dt_rank);
+    dt = s->dt;  // NOTE: dt is now bigger: (d_inner) instead of (dt_rank)
 
     //  Discretize A and B
     // dA = torch.exp(torch.einsum("d,dn->dn", dt, self.A))   # A (d_inner, d_state), dA (d_inner, d_state)

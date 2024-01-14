@@ -6,7 +6,15 @@
 
 Inference of Mamba models in pure C
 
-Based on [llama2.c](https://github.com/karpathy/llama2.c)
+Inspired and using code from [llama2.c](https://github.com/karpathy/llama2.c)
+
+This implements only the recurrent mode of Mamba SSM
+
+You can compare it with the [related pytorch impementation](https://github.com/kroggen/mamba-cpu/tree/recurrent-only)
+
+No support for batches. The code is minimal for learning purposes.
+
+Even so, it is way faster than pytorch on CPU!!!
 
 
 ## Fast Start
@@ -17,7 +25,7 @@ python3 export.py state-spaces/mamba-130m model.bin
 make fast
 ./mamba model.bin -n 20 -i "Customer Support should" -t 0.0
 ```
-
+You can select another model on the export part
 
 ## Models
 
@@ -41,6 +49,14 @@ wget https://huggingface.co/state-spaces/mamba-130m/resolve/main/config.json?dow
 wget https://huggingface.co/state-spaces/mamba-130m/resolve/main/pytorch_model.bin?download=true -O pytorch_model.bin
 python3 export.py . model.bin
 ```
+
+
+## Notes
+
+The tokenizer may need some more work for special characters
+
+Feel free to contribute and send a PR
+
 
 
 ## License

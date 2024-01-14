@@ -29,14 +29,14 @@ You can select another model on the export part
 
 ## Models
 
-Currently these are the available models:
+You can use these models stored on [HuggingFace](https://huggingface.co/state-spaces):
 
-* [state-spaces/mamba-130m](https://huggingface.co/state-spaces/mamba-130m)
-* [state-spaces/mamba-370m](https://huggingface.co/state-spaces/mamba-370m)
-* [state-spaces/mamba-790m](https://huggingface.co/state-spaces/mamba-790m)
-* [state-spaces/mamba-1.4b](https://huggingface.co/state-spaces/mamba-1.4b)
-* [state-spaces/mamba-2.8b](https://huggingface.co/state-spaces/mamba-2.8b)
-* [state-spaces/mamba-2.8b-slimpj](https://huggingface.co/state-spaces/mamba-2.8b-slimpj)
+* `state-spaces/mamba-130m`
+* `state-spaces/mamba-370m`
+* `state-spaces/mamba-790m`
+* `state-spaces/mamba-1.4b`
+* `state-spaces/mamba-2.8b`
+* `state-spaces/mamba-2.8b-slimpj`
 
 You can specify the model name as an argument to the `export.py` script
 

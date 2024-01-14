@@ -280,6 +280,34 @@ void update_last_column(float* matrix, float* x, int rows, int cols) {
     }
 }
 
+// conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
+// conv_state[:, -1] = x
+void shift_and_update_last_column(float* matrix, float* x, int rows, int cols) {
+    #pragma omp parallel for
+    for (int i = 0; i < rows; i++) {
+        float* row = matrix + i * cols;
+        for (int j = 0; j < cols - 1; j++) {
+            row[j] = row[j + 1];
+        }
+        row[cols - 1] = x[i];
+    }
+}
+
+// x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
+// x = x + self.conv1d.bias
+// x = F.silu(x)
+void conv1d_silu(float* x, float* conv_state, float* conv1d_weight, float* conv1d_bias, int d_inner, int d_conv) {
+    // conv_state[d_inner, d_conv], conv1d_weight[d_inner, d_conv], conv1d_bias[d_inner] -> x[d_inner]
+    for (int i = 0; i < d_inner; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < d_conv; j++) {
+            int index = i * d_conv + j;
+            val += conv_state[index] * conv1d_weight[index];
+        }
+        x[i] = silu(val + conv1d_bias[i]);
+    }
+}
+
 void rowwise_dot_product(float* out, float* matrix, float* weights, int rows, int cols) {
     // matrix[rows,cols], weights[cols] -> out[rows]
     // this is a dot product of each row of the matrix with the weights
@@ -403,19 +431,17 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     float* z = s->xz + d_inner;  // z (d_inner)
 
     // Conv step
-    // conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))   # Update state (d w)
+    // conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
     shift_matrix_left(conv_state, d_inner, d_conv);
     // conv_state[:, -1] = x
     update_last_column(conv_state, x, d_inner, d_conv);
-    // x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (d)
-    elementwise_multiply(s->temp, conv_state, w->conv1d_weight + l*d_inner*d_conv, d_inner * d_conv);
-    sum_along_last_dim(x, s->temp, d_inner, d_conv);
+    //shift_and_update_last_column(conv_state, x, d_inner, d_conv);  -- appears slower (?)
+
+    // x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
     // x = x + self.conv1d.bias
-    elementwise_add(x, x, w->conv1d_bias + l*d_inner, d_inner);
     // x = F.silu(x)
-    for (int i = 0; i < d_inner; i++) {
-        x[i] = silu(x[i]);
-    }
+    conv1d_silu(x, conv_state, w->conv1d_weight + l*d_inner*d_conv, w->conv1d_bias + l*d_inner, d_inner, d_conv);
+
 
     // SSM step
     // x_db = self.x_proj(x)   # x_db (dt_rank+2*d_state)

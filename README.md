@@ -12,7 +12,7 @@ Inspired by and using code from [llama2.c](https://github.com/karpathy/llama2.c)
 
 This implements only the recurrent mode of Mamba SSM
 
-You can compare it with the [related pytorch impementation](https://github.com/kroggen/mamba-cpu/tree/recurrent-only)
+You can compare it with the [related pytorch implementation](https://github.com/kroggen/mamba-cpu/tree/recurrent-only)
 
 No support for batches. The code is minimal for learning purposes.
 

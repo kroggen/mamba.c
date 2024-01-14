@@ -393,12 +393,14 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     float* x = s->xz;            // x (d_inner)
     float* z = s->xz + d_inner;  // z (d_inner)
 
+
     // Conv step
-    // conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))   # Update state (d w)
+
+    // conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
     shift_matrix_left(conv_state, d_inner, d_conv);
     // conv_state[:, -1] = x
     update_last_column(conv_state, x, d_inner, d_conv);
-    // x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (d)
+    // x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
     elementwise_multiply(s->temp, conv_state, w->conv1d_weight + l*d_inner*d_conv, d_inner * d_conv);
     sum_along_last_dim(x, s->temp, d_inner, d_conv);
     // x = x + self.conv1d.bias
@@ -408,7 +410,9 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
         x[i] = silu(x[i]);
     }
 
+
     // SSM step
+
     // x_db = self.x_proj(x)   # x_db (dt_rank+2*d_state)
     matmul(s->x_db, x, w->x_proj + l*(dt_rank+2*d_state)*d_inner, dt_rank+2*d_state, d_inner);
     // dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
@@ -424,7 +428,7 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
         dt[i] = softplus(dt[i]);
     }
 
-    // Discretize A and B
+    //  Discretize A and B
     // dA = torch.exp(torch.einsum("d,dn->dn", dt, self.A))   # A (d_inner, d_state), dA (d_inner, d_state)
     broadcast_multiply(dA, dt, w->A + l*d_inner*d_state, d_inner, d_state);
     for (int i = 0; i < d_inner * d_state; i++) {
@@ -432,10 +436,13 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     }
     // dB = torch.einsum("d,n->dn", dt, B)    # dt (d_inner), B (d_state), dB (d_inner, d_state)
     outer_product(dB, dt, B, d_inner, d_state);
+
+    //  Update ssm_state
     // ssm_state.copy_(ssm_state * dA + rearrange(x, "d -> d 1") * dB)
     broadcast_multiply(s->temp, x, dB, d_inner, d_state);
     elementwise_multiply_and_add(ssm_state, ssm_state, dA, s->temp, d_inner * d_state);
 
+    //  Compute y
     // y = torch.einsum("dn,n->d", ssm_state, C) # ssm_state (d_inner, d_state), C (d_state), y (d_inner)
     rowwise_dot_product(y, ssm_state, C, d_inner, d_state);
     // y = y + self.D * x

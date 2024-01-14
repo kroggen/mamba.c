@@ -1,7 +1,7 @@
 # mamba.c
 
 <p align="center">
-  <img src="assets/cute-mamba.png" width="300" height="300" alt="Милый Мамба">
+  <img src="assets/mamba-c.png" width="300" height="300" alt="Мамба C">
 </p>
 
 <p align="right"><a href="https://github.com/kroggen/mamba.c/blob/learning/README.md">English</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-zh.md">中文</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ja.md">日本語</a></p>

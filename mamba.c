@@ -267,6 +267,7 @@ float silu(float x) {
 }
 
 void shift_matrix_left(float* matrix, int rows, int cols) {
+    #pragma omp parallel for
     for (int i = 0; i < rows; i++) {
         for (int j = 0; j < cols - 1; j++) {
             matrix[i * cols + j] = matrix[i * cols + j + 1];
@@ -275,6 +276,7 @@ void shift_matrix_left(float* matrix, int rows, int cols) {
 }
 
 void update_last_column(float* matrix, float* x, int rows, int cols) {
+    #pragma omp parallel for
     for (int i = 0; i < rows; i++) {
         matrix[i * cols + cols - 1] = x[i];
     }
@@ -284,6 +286,7 @@ void rowwise_dot_product(float* out, float* matrix, float* weights, int rows, in
     // matrix[rows,cols], weights[cols] -> out[rows]
     // this is a dot product of each row of the matrix with the weights
     // i.e. out[i] = matrix[i,:] @ weights
+    #pragma omp parallel for
     for (int i = 0; i < rows; i++) {
         float val = 0.0f;
         for (int j = 0; j < cols; j++) {
@@ -295,6 +298,7 @@ void rowwise_dot_product(float* out, float* matrix, float* weights, int rows, in
 
 void matmul(float* xout, float* x, float* w, int d, int n) {
     // w[d,n] @ x[n] -> xout[d]
+    #pragma omp parallel for
     for (int i = 0; i < d; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
@@ -306,6 +310,7 @@ void matmul(float* xout, float* x, float* w, int d, int n) {
 
 void linear(float* xout, float* x, float* w, float* b, int d, int n) {
     // w[d,n] @ x[n] + b[d] -> xout[d]
+    #pragma omp parallel for
     for (int i = 0; i < d; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
@@ -317,6 +322,7 @@ void linear(float* xout, float* x, float* w, float* b, int d, int n) {
 
 void broadcast_multiply(float* out, float* x, float* y, int d, int n) {
     // x[d], y[d,n] -> out[d,n]
+    #pragma omp parallel for
     for (int i = 0; i < d; i++) {
         for (int j = 0; j < n; j++) {
             int index = i * n + j;
@@ -327,18 +333,21 @@ void broadcast_multiply(float* out, float* x, float* y, int d, int n) {
 }
 
 void elementwise_multiply(float* result, float* matrix1, float* matrix2, int total_elements) {
+    #pragma omp parallel for
     for (int i = 0; i < total_elements; i++) {
         result[i] = matrix1[i] * matrix2[i];
     }
 }
 
 void elementwise_add(float* result, float* matrix1, float* matrix2, int total_elements) {
+    #pragma omp parallel for
     for (int i = 0; i < total_elements; i++) {
         result[i] = matrix1[i] + matrix2[i];
     }
 }
 
 void elementwise_multiply_and_add(float* result, float* matrix1, float* matrix2, float* matrix3, int total_elements) {
+    #pragma omp parallel for
     for (int i = 0; i < total_elements; i++) {
         result[i] = matrix1[i] * matrix2[i] + matrix3[i];
     }
@@ -346,6 +355,7 @@ void elementwise_multiply_and_add(float* result, float* matrix1, float* matrix2,
 
 void outer_product(float* out, float* x, float* y, int d, int n) {
     // x[d], y[n] -> out[d,n]
+    #pragma omp parallel for
     for (int i = 0; i < d; i++) {
         for (int j = 0; j < n; j++) {
             out[i * n + j] = x[i] * y[j];
@@ -354,6 +364,7 @@ void outer_product(float* out, float* x, float* y, int d, int n) {
 }
 
 void sum_along_last_dim(float* result, float* matrix, int rows, int cols) {
+    #pragma omp parallel for
     for (int i = 0; i < rows; i++) {
         float val = 0.0f;
         for (int j = 0; j < cols; j++) {

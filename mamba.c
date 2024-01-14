@@ -448,10 +448,8 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     // Conv step
 
     // conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
-    shift_matrix_left(conv_state, d_inner, d_conv);
     // conv_state[:, -1] = x
-    update_last_column(conv_state, x, d_inner, d_conv);
-    //shift_and_update_last_column(conv_state, x, d_inner, d_conv);  -- appears slower (?)
+    shift_and_update_last_column(conv_state, x, d_inner, d_conv);
 
     // x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
     // x = x + self.conv1d.bias

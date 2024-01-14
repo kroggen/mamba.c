@@ -50,6 +50,23 @@ wget https://huggingface.co/state-spaces/mamba-130m/resolve/main/pytorch_model.b
 python3 export.py . model.bin
 ```
 
+## Internal State
+
+As it is a recurrent model, it is possible to save the internal state and then return to that state later
+
+To get a copy of the internal state:
+
+```c
+  int state_size;
+  char* state = get_internal_state(mamba, &state_size);
+```
+
+To set the internal state:
+
+```c
+  set_internal_state(mamba, state, state_size);
+```
+
 
 ## Notes
 

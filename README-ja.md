@@ -26,6 +26,8 @@ python3 export.py state-spaces/mamba-130m model.bin
 make cuda
 ./mamba-cuda model.bin -n 20 -i "Customer Support should" -t 0.0
 ```
+Pythonは、トークン化器とモデルをよりシンプルな形式にエクスポートするためにのみ使用されます（transformersとpytorchが必要です）
+
 エクスポート部分で別のモデルを選択することができます
 
 ## モデル
@@ -71,12 +73,11 @@ python3 export.py . model.bin
 
 ## ブランチ
 
-主に2つのブランチがあります：
+コードは3つのバージョンで利用可能で、それぞれ別のブランチにあります：
 
-* `learning` - 非常に基本的な
-* `fused` - 基本的な機能を大きなものに統合
-
-それらを[比較](https://github.com/kroggen/mamba.c/compare/learning..fused)することができます
+* `learning` - 基本的なもの
+* `fused` - 基本的な機能をより大きなものに統合（[比較](https://github.com/kroggen/mamba.c/compare/learning..fused)することができます）
+* `cuda` - シンプルなGPU実装、理解しやすい
 
 
 ## ノート

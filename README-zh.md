@@ -26,6 +26,8 @@ python3 export.py state-spaces/mamba-130m model.bin
 make fast
 ./mamba model.bin -n 20 -i "Customer Support should" -t 0.0
 ```
+Python仅用于将分词器和模型导出为更简单的格式（需要transformers和pytorch）
+
 您可以在导出部分选择另一个模型
 
 ## 模型
@@ -71,12 +73,11 @@ python3 export.py . model.bin
 
 ## 分支
 
-主要有2个分支：
+代码有3个版本，每个版本在一个单独的分支上：
 
 * `learning` - 非常基础
-* `fused` - 将基本功能融合成更大的功能
-
-您可以[比较](https://github.com/kroggen/mamba.c/compare/learning..fused)它们
+* `fused` - 将基本功能融合成更大的功能（你可以[比较](https://github.com/kroggen/mamba.c/compare/learning..fused)它们）
+* `cuda` - 简单的GPU实现，易于理解
 
 
 ## 注释

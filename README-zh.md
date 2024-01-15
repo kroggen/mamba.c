@@ -23,8 +23,8 @@
 ```
 python3 tokenizer.py
 python3 export.py state-spaces/mamba-130m model.bin
-make fast
-./mamba model.bin -n 20 -i "Customer Support should" -t 0.0
+make cuda
+./mamba-cuda model.bin -n 20 -i "Customer Support should" -t 0.0
 ```
 您可以在导出部分选择另一个模型
 

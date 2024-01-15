@@ -13,6 +13,14 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+#include <cuda_runtime_api.h>
+#include <cuda_fp16.h>
+#include <cub/cub.cuh>
+
+int divUp(int a, int b) {
+    return (a - 1) / b + 1;
+}
+
 // ----------------------------------------------------------------------------
 // Mamba model
 
@@ -56,7 +64,8 @@ typedef struct {
     float *x_db;   // (dt_rank+2*d_state)  dt, B, C are pointers into this buffer
     float *dt;     // (d_inner)            later, dt is a pointer to this buffer
     float *y;      // (d_inner)
-    float *logits; // (rounded_vocab_size)
+    float *logits_gpu; // (rounded_vocab_size)
+    float *logits_cpu; // (rounded_vocab_size)
     // internal state, separate memory for each layer
     float* conv_state; // (n_layers, d_inner, d_conv)
     float* ssm_state;  // (n_layers, d_inner, d_state)
@@ -66,40 +75,43 @@ typedef struct {
     Config config; // the hyperparameters of the architecture (the blueprint)
     MambaWeights weights; // the weights of the model
     RunState state; // buffers for the "wave" of activations in the forward pass
-    // some more state needed to properly clean up the memory mapping (sigh)
-    int fd; // file descriptor for memory mapping
-    float* data; // memory mapped data pointer
-    ssize_t file_size; // size of the checkpoint file in bytes
 } Mamba;
 
 void malloc_run_state(RunState* s, Config* p) {
+    // allocated on the GPU
     // memory reused by all layers
-    s->input = malloc(p->dim * sizeof(float));
-    s->hidden_state = malloc(p->dim * sizeof(float));
-    s->xz = malloc(2 * p->d_inner * sizeof(float));
-    s->x_db = malloc((p->dt_rank + 2 * p->d_state) * sizeof(float));
-    s->dt = malloc(p->d_inner * sizeof(float));
-    s->y = malloc(p->d_inner * sizeof(float));
-    s->logits = malloc(p->rounded_vocab_size * sizeof(float));
+    cudaMalloc((void**)&s->input, p->dim * sizeof(float));
+    cudaMalloc((void**)&s->hidden_state, p->dim * sizeof(float));
+    cudaMalloc((void**)&s->xz, 2 * p->d_inner * sizeof(float));
+    cudaMalloc((void**)&s->x_db, (p->dt_rank + 2 * p->d_state) * sizeof(float));
+    cudaMalloc((void**)&s->dt, p->d_inner * sizeof(float));
+    cudaMalloc((void**)&s->y, p->d_inner * sizeof(float));
+    cudaMalloc((void**)&s->logits_gpu, p->rounded_vocab_size * sizeof(float));
     // internal state, separate memory for each layer
-    s->conv_state = calloc(p->n_layers * p->d_inner * p->d_conv, sizeof(float));
-    s->ssm_state = calloc(p->n_layers * p->d_inner * p->d_state, sizeof(float));
+    cudaMalloc((void**)&s->conv_state, p->n_layers * p->d_inner * p->d_conv * sizeof(float));
+    cudaMalloc((void**)&s->ssm_state, p->n_layers * p->d_inner * p->d_state * sizeof(float));
+    // allocated on the CPU
+    s->logits_cpu = (float*) malloc(p->rounded_vocab_size * sizeof(float));
     // ensure all mallocs went fine
-    if (!s->xz || !s->x_db || !s->dt || !s->y
-     || !s->logits || !s->conv_state || !s->ssm_state) {
+    if (!s->input || !s->hidden_state || !s->xz || !s->x_db || !s->dt || !s->y
+      || !s->logits_gpu || !s->logits_cpu || !s->conv_state || !s->ssm_state) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
+    // zero out the internal state
+    cudaMemset(s->conv_state, 0, p->n_layers * p->d_inner * p->d_conv * sizeof(float));
+    cudaMemset(s->ssm_state, 0, p->n_layers * p->d_inner * p->d_state * sizeof(float));
 }
 
 void reset_internal_state(Mamba* mamba) {
     // reset the internal state of the model
     RunState* s = &mamba->state;
     Config* p = &mamba->config;
-    memset(s->conv_state, 0, p->n_layers * p->d_inner * p->d_conv * sizeof(float));
-    memset(s->ssm_state, 0, p->n_layers * p->d_inner * p->d_state * sizeof(float));
+    cudaMemset(s->conv_state, 0, p->n_layers * p->d_inner * p->d_conv * sizeof(float));
+    cudaMemset(s->ssm_state, 0, p->n_layers * p->d_inner * p->d_state * sizeof(float));
 }
 
+/*
 char* get_internal_state(Mamba* mamba, int* state_size) {
     // get the internal state of the model
     Config* p = &mamba->config;
@@ -127,17 +139,21 @@ void set_internal_state(Mamba* mamba, char* state, int state_size) {
         memcpy(s->ssm_state, state + conv_state_size, ssm_state_size);
     }
 }
+*/
 
 void free_run_state(RunState* s) {
-    free(s->input);
-    free(s->hidden_state);
-    free(s->xz);
-    free(s->x_db);
-    free(s->dt);
-    free(s->y);
-    free(s->logits);
-    free(s->conv_state);
-    free(s->ssm_state);
+    // allocated on the GPU
+    cudaFree(s->input);
+    cudaFree(s->hidden_state);
+    cudaFree(s->xz);
+    cudaFree(s->x_db);
+    cudaFree(s->dt);
+    cudaFree(s->y);
+    cudaFree(s->logits_gpu);
+    cudaFree(s->conv_state);
+    cudaFree(s->ssm_state);
+    // allocated on the CPU
+    free(s->logits_cpu);
 }
 
 void memory_map_weights(MambaWeights *w, Config* p, float* ptr) {
@@ -160,8 +176,7 @@ void memory_map_weights(MambaWeights *w, Config* p, float* ptr) {
     w->lm_head = p->shared_classifier ? w->token_embedding_table : ptr;
 }
 
-void load_model_file(char* model_path, Config* config, MambaWeights* weights,
-                     int* fd, float** data, ssize_t* file_size) {
+void load_model_file(char* model_path, Config* config, MambaWeights* weights) {
     FILE *file = fopen(model_path, "rb");
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", model_path); exit(EXIT_FAILURE); }
     // read the magic number
@@ -181,103 +196,187 @@ void load_model_file(char* model_path, Config* config, MambaWeights* weights,
     }
     // figure out the file size
     fseek(file, 0, SEEK_END); // move file pointer to end of file
-    *file_size = ftell(file); // get the file size, in bytes
+    ssize_t file_size = ftell(file); // get the file size, in bytes
     fclose(file);
     // memory map the model weights into the data pointer
-    *fd = open(model_path, O_RDONLY); // open in read only mode
-    if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
-    if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-    float* weights_ptr = *data + (256 / 4);
-    memory_map_weights(weights, config, weights_ptr);
+    int fd = open(model_path, O_RDONLY); // open in read only mode
+    if (fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
+    char* data = (char*) mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
+    char* weights_ptr = data + 256;
+    size_t weights_size = file_size - 256;
+    // allocate memory for the weights on the GPU
+    float* gpu_ptr;
+    cudaMalloc(&gpu_ptr, weights_size);
+    if (!gpu_ptr) { fprintf(stderr, "GPU malloc failed!\n"); exit(EXIT_FAILURE); }
+    // copy the weights to the GPU
+    cudaMemcpyAsync(gpu_ptr, weights_ptr, weights_size, cudaMemcpyHostToDevice);
+    // set the weights pointers
+    memory_map_weights(weights, config, gpu_ptr);
+    // wait for the copy to finish
+    cudaDeviceSynchronize();
+    // release the memory on the CPU
+    munmap(data, file_size);
+    close(fd);
 }
 
 void load_model(Mamba* m, char* model_path) {
     // read the Config and the Weights from the model file
-    load_model_file(model_path, &m->config, &m->weights, &m->fd, &m->data, &m->file_size);
+    load_model_file(model_path, &m->config, &m->weights);
     // allocate the RunState buffers
     malloc_run_state(&m->state, &m->config);
 }
 
 void free_model(Mamba* m) {
-    // close the memory mapping
-    if (m->data != MAP_FAILED) { munmap(m->data, m->file_size); }
-    if (m->fd != -1) { close(m->fd); }
     // free the RunState buffers
     free_run_state(&m->state);
+    // free the weights on the GPU
+    cudaFree(m->weights.token_embedding_table);
 }
 
 // ----------------------------------------------------------------------------
-// neural net blocks; the dynamics of the model
+// GPU functions
 
-void rmsnorm(float* o, float* x, float* weight, int size) {
-    // calculate sum of squares
-    float ss = 0.0f;
-    for (int j = 0; j < size; j++) {
-        ss += x[j] * x[j];
-    }
-    ss /= size;
-    ss += 1e-5f;
-    ss = 1.0f / sqrtf(ss);
-    // normalize and scale
-    for (int j = 0; j < size; j++) {
-        o[j] = x[j] * weight[j] * ss;
-    }
-}
-
-void softmax(float* x, int size) {
-    // find max value (for numerical stability)
-    float max_val = x[0];
-    for (int i = 1; i < size; i++) {
-        if (x[i] > max_val) {
-            max_val = x[i];
-        }
-    }
-    // exp and sum
-    float sum = 0.0f;
-    for (int i = 0; i < size; i++) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
-    }
-    // normalize
-    for (int i = 0; i < size; i++) {
-        x[i] /= sum;
-    }
-}
-
-float softplus(float x) {
+__device__ __forceinline__ float softplus(float x) {
     return logf(1.0f + expf(x));
 }
 
-float sigmoid(float x) {
+__device__ __forceinline__ float sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
-float silu(float x) {
+__device__ __forceinline__ float silu(float x) {
     return x * sigmoid(x);
 }
 
-void shift_matrix_left(float* matrix, int rows, int cols) {
-    #pragma omp parallel for
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < cols - 1; j++) {
-            matrix[i * cols + j] = matrix[i * cols + j + 1];
+__global__ void scalar_multiply_kernel(float* arr, float value, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size)
+        arr[i] = arr[i] * value;
+}
+
+__global__ void rmsnorm_kernel(float* out, float* x, float* weight, int size) {
+    float ss = 0.0f;
+
+    int tid = threadIdx.x;
+    int step = blockDim.x;
+
+    // calculate sum of squares
+    for (int index = tid; index < size; index += step) {
+        float val = x[index];
+        ss += (val * val);
+    }
+
+    // find the global sum of squares
+    using BlockReduce = cub::BlockReduce<float, 1024>;
+    __shared__ typename BlockReduce::TempStorage temp;
+    ss = BlockReduce(temp).Sum(ss);
+
+    // find the mean of squares, using the first thread
+    __shared__ float shared_ss;
+    if (threadIdx.x == 0) {
+        ss /= size;
+        ss += 1e-5f;
+        ss = 1.0f / sqrtf(ss);
+        shared_ss = ss;
+    }
+    __syncthreads();
+    ss = shared_ss;
+
+    // normalize
+    for (int index = tid; index < size; index += step) {
+        out[index] = x[index] * ss * weight[index];
+    }
+}
+
+__global__ void softmax_kernel(float* __restrict__ x, int size) {
+    using BlockReduce = cub::BlockReduce<float, 1024>;
+    __shared__ typename BlockReduce::TempStorage temp;
+    __shared__ float shared_val;
+
+    int tid = threadIdx.x;
+    int step = blockDim.x;
+
+    // find max value for each thread
+    float max_val = tid < size ? x[tid] : 0;
+    for (int i = tid + step; i < size; i += step)
+        if (x[i] > max_val)
+            max_val = x[i];
+
+    // find the global max value
+    max_val = BlockReduce(temp).Reduce(max_val, cub::Max());
+    if (threadIdx.x == 0)
+        shared_val = max_val;
+    __syncthreads();
+    max_val = shared_val;
+
+    // exp and sum
+    float sum = 0.0f;
+    for (int i = tid; i < size; i += step) {
+        x[i] = expf(x[i] - max_val);
+        sum += x[i];
+    }
+
+    // find the global sum
+    sum = BlockReduce(temp).Sum(sum);
+    if (threadIdx.x == 0)
+        shared_val = sum;
+    __syncthreads();
+    sum = shared_val;
+
+    // normalize
+    for (int i = tid; i < size; i += step)
+        x[i] /= sum;
+}
+
+__global__ void argmax_kernel(float* __restrict__ x, int size, int *result) {
+    using BlockReduce = cub::BlockReduce<float, 1024>;
+    __shared__ typename BlockReduce::TempStorage temp;
+    __shared__ float shared_val;
+
+    int tid = threadIdx.x;
+    int step = blockDim.x;
+
+    // find local max value and its position
+    float max_val = tid < size ? x[tid] : 0;
+    int   max_pos = tid < size ? tid : 0;
+    for (int i = tid + step; i < size; i += step) {
+        if (x[i] > max_val) {
+            max_val = x[i];
+            max_pos = i;
         }
     }
-}
 
-void update_last_column(float* matrix, float* x, int rows, int cols) {
-    #pragma omp parallel for
-    for (int i = 0; i < rows; i++) {
-        matrix[i * cols + cols - 1] = x[i];
+    // find the global max value
+    float global_max_val;
+    global_max_val = BlockReduce(temp).Reduce(max_val, cub::Max());
+    if (threadIdx.x == 0)
+        shared_val = global_max_val;
+    __syncthreads();
+    global_max_val = shared_val;
+
+    // get its position
+    if (max_val == global_max_val) {
+        *result = max_pos;
     }
 }
 
-// conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
-// conv_state[:, -1] = x
-void shift_and_update_last_column(float* matrix, float* x, int rows, int cols) {
-    #pragma omp parallel for
-    for (int i = 0; i < rows; i++) {
+__global__ void matmul_kernel(float* xout, float* x, float* w, int d, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < d) {
+        float val = 0.0f;
+        for (int j = 0; j < n; j++) {
+            val += w[i * n + j] * x[j];
+        }
+        xout[i] = val;
+    }
+}
+
+__global__ void shift_and_update_last_column_kernel(float* matrix, float* x, int rows, int cols) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < rows) {
         float* row = matrix + i * cols;
         for (int j = 0; j < cols - 1; j++) {
             row[j] = row[j + 1];
@@ -286,13 +385,10 @@ void shift_and_update_last_column(float* matrix, float* x, int rows, int cols) {
     }
 }
 
-// x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
-// x = x + self.conv1d.bias
-// x = F.silu(x)
-void conv1d_silu(float* x, float* conv_state, float* conv1d_weight, float* conv1d_bias, int d_inner, int d_conv) {
-    // conv_state[d_inner, d_conv], conv1d_weight[d_inner, d_conv], conv1d_bias[d_inner] -> x[d_inner]
-    #pragma omp parallel for
-    for (int i = 0; i < d_inner; i++) {
+__global__ void conv1d_silu_kernel(float* x, float* conv_state, float* conv1d_weight, float* conv1d_bias, int d_inner, int d_conv) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < d_inner) {
         float val = 0.0f;
         for (int j = 0; j < d_conv; j++) {
             int index = i * d_conv + j;
@@ -302,49 +398,10 @@ void conv1d_silu(float* x, float* conv_state, float* conv1d_weight, float* conv1
     }
 }
 
-void rowwise_dot_product(float* out, float* matrix, float* weights, int rows, int cols) {
-    // matrix[rows,cols], weights[cols] -> out[rows]
-    // this is a dot product of each row of the matrix with the weights
-    // i.e. out[i] = matrix[i,:] @ weights
-    #pragma omp parallel for
-    for (int i = 0; i < rows; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < cols; j++) {
-            val += matrix[i * cols + j] * weights[j];
-        }
-        out[i] = val;
-    }
-}
+__global__ void dense_softplus_kernel(float* xout, float* x, float* w, float* b, int d, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-void matmul(float* xout, float* x, float* w, int d, int n) {
-    // w[d,n] @ x[n] -> xout[d]
-    #pragma omp parallel for
-    for (int i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val;
-    }
-}
-
-void linear(float* xout, float* x, float* w, float* b, int d, int n) {
-    // w[d,n] @ x[n] + b[d] -> xout[d]
-    #pragma omp parallel for
-    for (int i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val + b[i];
-    }
-}
-
-void dense_softplus(float* xout, float* x, float* w, float* b, int d, int n) {
-    // w[d,n] @ x[n] + b[d] -> xout[d]
-    // xout[i] = softplus(w[i,:] @ x + b[i])
-    #pragma omp parallel for
-    for (int i = 0; i < d; i++) {
+    if (i < d) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
             val += w[i * n + j] * x[j];
@@ -353,64 +410,11 @@ void dense_softplus(float* xout, float* x, float* w, float* b, int d, int n) {
     }
 }
 
-void broadcast_multiply(float* out, float* x, float* y, int d, int n) {
-    // x[d], y[d,n] -> out[d,n]
-    #pragma omp parallel for
-    for (int i = 0; i < d; i++) {
-        for (int j = 0; j < n; j++) {
-            int index = i * n + j;
-            out[index] = x[i] * y[index];
-            //out[i * n + j] = x[i] * y[i * n + j];
-        }
-    }
-}
+__global__ void selective_scan_kernel(float* y, float* ssm_state, float* dt, float* A, float* B, float* C, float* D,
+                                      float* x, float* z, int d_inner, int d_state) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-void elementwise_multiply(float* result, float* matrix1, float* matrix2, int total_elements) {
-    #pragma omp parallel for
-    for (int i = 0; i < total_elements; i++) {
-        result[i] = matrix1[i] * matrix2[i];
-    }
-}
-
-void elementwise_add(float* result, float* matrix1, float* matrix2, int total_elements) {
-    #pragma omp parallel for
-    for (int i = 0; i < total_elements; i++) {
-        result[i] = matrix1[i] + matrix2[i];
-    }
-}
-
-void elementwise_multiply_and_add(float* result, float* matrix1, float* matrix2, float* matrix3, int total_elements) {
-    #pragma omp parallel for
-    for (int i = 0; i < total_elements; i++) {
-        result[i] = matrix1[i] * matrix2[i] + matrix3[i];
-    }
-}
-
-void outer_product(float* out, float* x, float* y, int d, int n) {
-    // x[d], y[n] -> out[d,n]
-    #pragma omp parallel for
-    for (int i = 0; i < d; i++) {
-        for (int j = 0; j < n; j++) {
-            out[i * n + j] = x[i] * y[j];
-        }
-    }
-}
-
-void sum_along_last_dim(float* result, float* matrix, int rows, int cols) {
-    #pragma omp parallel for
-    for (int i = 0; i < rows; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < cols; j++) {
-            val += matrix[i * cols + j];
-        }
-        result[i] = val;
-    }
-}
-
-void selective_scan(float* y, float* ssm_state, float* dt, float* A, float* B, float* C, float* D,
-                    float* x, float* z, int d_inner, int d_state) {
-    #pragma omp parallel for
-    for (int i = 0; i < d_inner; i++) {
+    if (i < d_inner) {
         float val = 0.0f;
         for (int j = 0; j < d_state; j++) {
             int index = i * d_state + j;
@@ -426,6 +430,58 @@ void selective_scan(float* y, float* ssm_state, float* dt, float* A, float* B, f
         y[i] = val * silu(z[i]);
     }
 }
+
+__global__ void add_residual_connection_kernel(float* hidden_state, float* input, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < size) {
+        hidden_state[i] += input[i];
+        // copy hidden_state back into input for the next layer
+        input[i] = hidden_state[i];
+    }
+}
+
+// ----------------------------------------------------------------------------
+
+void rmsnorm(float* out, float* x, float* weight, int size) {
+    rmsnorm_kernel<<<1, 1024>>>(out, x, weight, size);
+}
+
+void softmax(float* x, int size) {
+    softmax_kernel<<<1, 1024>>>(x, size);
+}
+
+void scalar_multiply(float* arr, float value, int size) {
+    scalar_multiply_kernel <<<divUp(size, 1024), 1024>>> (arr, value, size);
+}
+
+void shift_and_update_last_column(float* matrix, float* x, int rows, int cols) {
+    shift_and_update_last_column_kernel <<<divUp(rows, 1024), 1024>>> (matrix, x, rows, cols);
+}
+
+void conv1d_silu(float* x, float* conv_state, float* conv1d_weight, float* conv1d_bias, int d_inner, int d_conv) {
+    conv1d_silu_kernel <<<divUp(d_inner, 1024), 1024>>> (x, conv_state, conv1d_weight, conv1d_bias, d_inner, d_conv);
+}
+
+void matmul(float* xout, float* x, float* w, int d, int n) {
+    matmul_kernel <<<divUp(d, 1024), 1024>>> (xout, x, w, d, n);
+}
+
+void dense_softplus(float* xout, float* x, float* w, float* b, int d, int n) {
+    dense_softplus_kernel <<<divUp(d, 1024), 1024>>> (xout, x, w, b, d, n);
+}
+
+void selective_scan(float* y, float* ssm_state, float* dt, float* A, float* B, float* C, float* D,
+                    float* x, float* z, int d_inner, int d_state) {
+    selective_scan_kernel <<<divUp(d_inner, 1024), 1024>>> (y, ssm_state, dt, A, B, C, D, x, z, d_inner, d_state);
+}
+
+void add_residual_connection(float* hidden_state, float* input, int size) {
+    add_residual_connection_kernel <<<divUp(size, 1024), 1024>>> (hidden_state, input, size);
+}
+
+// ----------------------------------------------------------------------------
+// the forward pass
 
 void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     Config* p = &mamba->config;
@@ -486,7 +542,7 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     matmul(hidden_state, y, w->out_proj + l*dim*d_inner, dim, d_inner);
 }
 
-float* forward(Mamba* mamba, int token) {
+void forward(Mamba* mamba, int token) {
     // a few convenience variables
     Config* p = &mamba->config;
     MambaWeights* w = &mamba->weights;
@@ -497,7 +553,7 @@ float* forward(Mamba* mamba, int token) {
 
     // copy the token embedding into x
     float* content_row = w->token_embedding_table + token * dim;
-    memcpy(input, content_row, dim * sizeof(float));
+    cudaMemcpyAsync(input, content_row, dim * sizeof(float), cudaMemcpyDeviceToDevice);
 
     // forward all the layers
     for(unsigned long long l = 0; l < p->n_layers; l++) {
@@ -506,19 +562,14 @@ float* forward(Mamba* mamba, int token) {
         // forward this layer
         forward_layer(mamba, l, hidden_state);
         // residual connection back into hidden_state
-        for (int i = 0; i < dim; i++) {
-            hidden_state[i] += input[i];
-            // copy hidden_state back into input for the next layer
-            input[i] = hidden_state[i];
-        }
+        add_residual_connection(hidden_state, input, dim);
     }
 
     // final rmsnorm
     rmsnorm(hidden_state, hidden_state, w->final_norm, dim);
 
     // classifier into logits
-    matmul(s->logits, hidden_state, w->lm_head, p->rounded_vocab_size, p->dim);
-    return s->logits;
+    matmul(s->logits_gpu, hidden_state, w->lm_head, p->rounded_vocab_size, p->dim);
 }
 
 // ----------------------------------------------------------------------------
@@ -618,7 +669,7 @@ void safe_printf(char *piece) {
 int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     // efficiently find the perfect match for str in vocab, return its index or -1 if not found
     TokenIndex tok = { .str = str }; // acts as the key to search for
-    TokenIndex *res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
+    TokenIndex *res = (TokenIndex*) bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
     return res != NULL ? res->id : -1;
 }
 
@@ -629,7 +680,7 @@ void encode(Tokenizer* t, char *text, int8_t add_bos, int8_t add_eos, int *token
 
     if (t->sorted_vocab == NULL) {
         // lazily malloc and sort the vocabulary
-        t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+        t->sorted_vocab = (TokenIndex*) malloc(t->vocab_size * sizeof(TokenIndex));
         for (int i = 0; i < t->vocab_size; i++) {
             t->sorted_vocab[i].str = t->vocab[i];
             t->sorted_vocab[i].id = i;
@@ -639,7 +690,7 @@ void encode(Tokenizer* t, char *text, int8_t add_bos, int8_t add_eos, int *token
 
     // create a temporary buffer that will store merge candidates of always two consecutive tokens
     // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
-    char* str_buffer = malloc((t->max_token_length*2 +1 +2) * sizeof(char));
+    char* str_buffer = (char*) malloc((t->max_token_length*2 +1 +2) * sizeof(char));
     size_t str_len = 0;
 
     // start at 0 tokens
@@ -760,15 +811,22 @@ typedef struct {
 
 int sample_argmax(float* probabilities, int n) {
     // return the index that has the highest probability
-    int max_i = 0;
-    float max_p = probabilities[0];
-    for (int i = 1; i < n; i++) {
-        if (probabilities[i] > max_p) {
-            max_i = i;
-            max_p = probabilities[i];
-        }
-    }
-    return max_i;
+    int max_pos;
+    int *pmax_pos;
+
+    // allocate memory on the device
+    cudaMalloc((void**)&pmax_pos, sizeof(int));
+
+    // call the kernel
+    argmax_kernel<<<1,1024>>>(probabilities, n, pmax_pos);
+
+    // copy the result back to host
+    cudaMemcpy(&max_pos, pmax_pos, sizeof(int), cudaMemcpyDeviceToHost);
+
+    // free the allocated memory
+    cudaFree(pmax_pos);
+
+    return max_pos;
 }
 
 int sample_mult(float* probabilities, int n, float coin) {
@@ -841,7 +899,7 @@ void build_sampler(Sampler* sampler, int vocab_size, float temperature, float to
     sampler->topp = topp;
     sampler->rng_state = rng_seed;
     // buffer only used with nucleus sampling; may not need but it's ~small
-    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+    sampler->probindex = (ProbIndex*) malloc(sampler->vocab_size * sizeof(ProbIndex));
 }
 
 void free_sampler(Sampler* sampler) {
@@ -859,17 +917,21 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
-int sample(Sampler* sampler, float* logits) {
+int sample(Sampler* sampler, RunState* state) {
     // sample the token given the logits and some hyperparameters
     int next;
+    float* logits = state->logits_cpu;
     if (sampler->temperature == 0.0f) {
         // greedy argmax sampling: take the token with the highest probability
-        next = sample_argmax(logits, sampler->vocab_size);
+        next = sample_argmax(state->logits_gpu, sampler->vocab_size);
     } else {
         // apply the temperature to the logits
-        for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
+        float inv_temperature = 1.0f / sampler->temperature;
+        scalar_multiply(state->logits_gpu, inv_temperature, sampler->vocab_size);
         // apply softmax to the logits to get the probabilities for next token
-        softmax(logits, sampler->vocab_size);
+        softmax(state->logits_gpu, sampler->vocab_size);
+        // copy the logits from GPU to the CPU
+        cudaMemcpy(logits, state->logits_gpu, sampler->vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
         // flip a (float) coin (this is our source of entropy for sampling)
         float coin = random_f32(&sampler->rng_state);
         // we sample from this distribution to get the next token
@@ -925,7 +987,7 @@ void generate(Mamba *mamba, Tokenizer *tokenizer, Sampler *sampler, char *prompt
     while (pos < steps) {
 
         // forward the model to get logits for the next token
-        float* logits = forward(mamba, token);
+        forward(mamba, token);
 
         // advance the state machine
         if (pos < num_prompt_tokens - 1) {
@@ -933,7 +995,7 @@ void generate(Mamba *mamba, Tokenizer *tokenizer, Sampler *sampler, char *prompt
             next = prompt_tokens[pos + 1];
         } else {
             // otherwise sample the next token from the logits
-            next = sample(sampler, logits);
+            next = sample(sampler, &mamba->state);
         }
         pos++;
 
@@ -993,7 +1055,7 @@ void chat(Mamba *mamba, Tokenizer *tokenizer, Sampler *sampler,
     int8_t user_turn = 1; // user starts
     int next;        // will store the next token in the sequence
     int token;       // stores the current token to feed into the model
-    int prev_token;
+    //int prev_token;
     int pos = 0;     // position in the sequence
     while (pos < steps) {
 
@@ -1045,8 +1107,8 @@ void chat(Mamba *mamba, Tokenizer *tokenizer, Sampler *sampler,
         if (token == EOS) { user_turn = 1; }
 
         // forward the model to get logits for the next token
-        float* logits = forward(mamba, token);
-        next = sample(sampler, logits);
+        forward(mamba, token);
+        next = sample(sampler, &mamba->state);
         pos++;
 
         if (user_idx >= num_prompt_tokens && next != EOS) {

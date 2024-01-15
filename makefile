@@ -46,6 +46,10 @@ gnu:
 ompgnu:
 	$(CC) -Ofast -fopenmp -std=gnu11 mamba.c  -lm  -o mamba
 
+.PHONY: cuda
+cuda:
+	nvcc -O3 mamba.cu -o mamba-cuda -Xcudafe --diag_suppress=2464
+
 # run all tests
 .PHONY: test
 test:

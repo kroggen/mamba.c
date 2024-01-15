@@ -14,7 +14,6 @@
     #include <sys/mman.h>
 #endif
 #include <cuda_runtime_api.h>
-#include <cuda_fp16.h>
 #include <cub/cub.cuh>
 
 int divUp(int a, int b) {
@@ -111,7 +110,6 @@ void reset_internal_state(Mamba* mamba) {
     cudaMemset(s->ssm_state, 0, p->n_layers * p->d_inner * p->d_state * sizeof(float));
 }
 
-/*
 char* get_internal_state(Mamba* mamba, int* state_size) {
     // get the internal state of the model
     Config* p = &mamba->config;
@@ -121,8 +119,8 @@ char* get_internal_state(Mamba* mamba, int* state_size) {
     unsigned int total_size = conv_state_size + ssm_state_size;
     char* state = malloc(total_size);
     if (state) {
-        memcpy(state, s->conv_state, conv_state_size);
-        memcpy(state + conv_state_size, s->ssm_state, ssm_state_size);
+        cudaMemcpy(state, s->conv_state, conv_state_size, cudaMemcpyDeviceToHost);
+        cudaMemcpy(state + conv_state_size, s->ssm_state, ssm_state_size, cudaMemcpyDeviceToHost);
         *state_size = total_size;
     }
     return state;
@@ -135,11 +133,10 @@ void set_internal_state(Mamba* mamba, char* state, int state_size) {
     unsigned int conv_state_size = p->n_layers * p->d_inner * p->d_conv * sizeof(float);
     unsigned int ssm_state_size = p->n_layers * p->d_inner * p->d_state * sizeof(float);
     if (state_size == conv_state_size + ssm_state_size) {
-        memcpy(s->conv_state, state, conv_state_size);
-        memcpy(s->ssm_state, state + conv_state_size, ssm_state_size);
+        cudaMemcpy(s->conv_state, state, conv_state_size, cudaMemcpyHostToDevice);
+        cudaMemcpy(s->ssm_state, state + conv_state_size, ssm_state_size, cudaMemcpyHostToDevice);
     }
 }
-*/
 
 void free_run_state(RunState* s) {
     // allocated on the GPU

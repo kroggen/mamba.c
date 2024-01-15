@@ -27,6 +27,8 @@ python3 export.py state-spaces/mamba-130m model.bin
 make fast
 ./mamba model.bin -n 20 -i "Customer Support should" -t 0.0
 ```
+Python is only used to export the tokenizer and the model to a simpler format (requires transformers and pytorch)
+
 You can select another model on the export part
 
 ## Models
@@ -72,12 +74,11 @@ To set the internal state:
 
 ## Branches
 
-There are mainly 2 branches:
+The code is available on 3 versions, each on a separate branch:
 
 * `learning` - very basic
-* `fused` - fuse the basic functions into bigger ones
-
-You can [compare](https://github.com/kroggen/mamba.c/compare/learning..fused) them
+* `fused` - fuse the basic functions into bigger ones (you can [compare](https://github.com/kroggen/mamba.c/compare/learning..fused) them)
+* `cuda` - simple GPU implementation, easy to understand
 
 
 ## Notes

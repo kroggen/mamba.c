@@ -80,6 +80,11 @@ The code is available on 3 versions, each on a separate branch:
 * `fused` - fuse the basic functions into bigger ones (you can [compare](https://github.com/kroggen/mamba.c/compare/learning..fused) them)
 * `cuda` - simple GPU implementation, easy to understand
 
+There is also code for Mamba 2:
+
+* `mamba2-learning` - very basic ([compare with mamba1](https://github.com/kroggen/mamba.c/compare/learning..mamba2-learning))
+* `mamba2-fused` - fused functions ([compare with learning](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba2-fused) | [compare with mamba1](https://github.com/kroggen/mamba.c/compare/fused..mamba2-fused))
+
 
 ## Notes
 

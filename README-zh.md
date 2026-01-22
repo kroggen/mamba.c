@@ -6,7 +6,7 @@
 
 <p align="right"><a href="https://github.com/kroggen/mamba.c/blob/learning/README.md">English</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ja.md">日本語</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ru.md">Русский</a></p>
 
-纯C语言推断Mamba模型
+纯C语言推断Mamba 1 & 2模型
 
 受到[llama2.c](https://github.com/karpathy/llama2.c)的启发并使用其代码
 
@@ -78,6 +78,11 @@ python3 export.py . model.bin
 * `learning` - 非常基础
 * `fused` - 将基本功能融合成更大的功能（你可以[比较](https://github.com/kroggen/mamba.c/compare/learning..fused)它们）
 * `cuda` - 简单的GPU实现，易于理解
+
+Mamba 2的代码也可用：
+
+* `mamba2-learning` - 非常基础（[与mamba1比较](https://github.com/kroggen/mamba.c/compare/learning..mamba2-learning)）
+* `mamba2-fused` - 融合函数（[与learning比较](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba2-fused) | [与mamba1比较](https://github.com/kroggen/mamba.c/compare/fused..mamba2-fused)）
 
 
 ## 注释

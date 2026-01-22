@@ -23,7 +23,7 @@ Even so, it is faster than pytorch on CPU!!!
 
 ```
 python3 tokenizer.py
-python3 export.py state-spaces/mamba-130m model.bin
+python3 export.py state-spaces/mamba2-130m model.bin
 make fast
 ./mamba model.bin -n 20 -i "Customer Support should" -t 0.0
 ```
@@ -33,14 +33,13 @@ You can select another model on the export part
 
 ## Models
 
-You can use these models stored on [HuggingFace](https://huggingface.co/state-spaces):
+You can use these Mamba 2 models stored on [HuggingFace](https://huggingface.co/state-spaces):
 
-* `state-spaces/mamba-130m`
-* `state-spaces/mamba-370m`
-* `state-spaces/mamba-790m`
-* `state-spaces/mamba-1.4b`
-* `state-spaces/mamba-2.8b`
-* `state-spaces/mamba-2.8b-slimpj`
+* `state-spaces/mamba2-130m`
+* `state-spaces/mamba2-370m`
+* `state-spaces/mamba2-780m`
+* `state-spaces/mamba2-1.3b`
+* `state-spaces/mamba2-2.7b`
 
 You can specify the model name as an argument to the `export.py` script
 
@@ -49,8 +48,8 @@ Note that the export script will download the model (if it's not already downloa
 Optionally you can also specify the path to the model file, if you downloaded it manually. Example:
 
 ```
-wget https://huggingface.co/state-spaces/mamba-130m/resolve/main/config.json?download=true -O config.json
-wget https://huggingface.co/state-spaces/mamba-130m/resolve/main/pytorch_model.bin?download=true -O pytorch_model.bin
+wget https://huggingface.co/state-spaces/mamba2-130m/resolve/main/config.json?download=true -O config.json
+wget https://huggingface.co/state-spaces/mamba2-130m/resolve/main/pytorch_model.bin?download=true -O pytorch_model.bin
 python3 export.py . model.bin
 ```
 

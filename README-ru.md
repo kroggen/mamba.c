@@ -23,7 +23,7 @@
 
 ```
 python3 tokenizer.py
-python3 export.py state-spaces/mamba-130m model.bin
+python3 export.py state-spaces/mamba2-130m model.bin
 make fast
 ./mamba model.bin -n 20 -i "Customer Support should" -t 0.0
 ```
@@ -33,14 +33,13 @@ Python используется только для экспорта токен�
 
 ## Модели
 
-Вы можете использовать эти модели, хранящиеся на [HuggingFace](https://huggingface.co/state-spaces):
+Вы можете использовать эти модели Mamba 2, хранящиеся на [HuggingFace](https://huggingface.co/state-spaces):
 
-* `state-spaces/mamba-130m`
-* `state-spaces/mamba-370m`
-* `state-spaces/mamba-790m`
-* `state-spaces/mamba-1.4b`
-* `state-spaces/mamba-2.8b`
-* `state-spaces/mamba-2.8b-slimpj`
+* `state-spaces/mamba2-130m`
+* `state-spaces/mamba2-370m`
+* `state-spaces/mamba2-780m`
+* `state-spaces/mamba2-1.3b`
+* `state-spaces/mamba2-2.7b`
 
 Вы можете указать имя модели в качестве аргумента для скрипта `export.py`
 
@@ -49,8 +48,8 @@ Python используется только для экспорта токен�
 При желании вы также можете указать путь к файлу модели, если вы загрузили его вручную. Пример:
 
 ```
-wget https://huggingface.co/state-spaces/mamba-130m/resolve/main/config.json?download=true -O config.json
-wget https://huggingface.co/state-spaces/mamba-130m/resolve/main/pytorch_model.bin?download=true -O pytorch_model.bin
+wget https://huggingface.co/state-spaces/mamba2-130m/resolve/main/config.json?download=true -O config.json
+wget https://huggingface.co/state-spaces/mamba2-130m/resolve/main/pytorch_model.bin?download=true -O pytorch_model.bin
 python3 export.py . model.bin
 ```
 

@@ -326,19 +326,68 @@ void softmax(float* x, int size) {
     }
 }
 
-void shift_matrix_left(float* matrix, int rows, int cols) {
+// Fused: shift matrix left and update last column in one pass
+// conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
+// conv_state[:, -1] = x
+void shift_and_update_last_column(float* matrix, float* x, int rows, int cols) {
     #pragma omp parallel for
     for (int i = 0; i < rows; i++) {
+        float* row = matrix + i * cols;
         for (int j = 0; j < cols - 1; j++) {
-            matrix[i * cols + j] = matrix[i * cols + j + 1];
+            row[j] = row[j + 1];
         }
+        row[cols - 1] = x[i];
     }
 }
 
-void update_last_column(float* matrix, float* x, int rows, int cols) {
+// Fused: conv1d dot product + bias + silu
+// xBC = sum(conv_state * conv1d.weight, dim=-1) + conv1d.bias
+// xBC = silu(xBC)
+void conv1d_silu(float* xBC, float* conv_state, float* conv1d_weight, float* conv1d_bias, int conv_dim, int d_conv) {
+    // conv_state[conv_dim, d_conv], conv1d_weight[conv_dim, d_conv], conv1d_bias[conv_dim] -> xBC[conv_dim]
     #pragma omp parallel for
-    for (int i = 0; i < rows; i++) {
-        matrix[i * cols + cols - 1] = x[i];
+    for (int i = 0; i < conv_dim; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < d_conv; j++) {
+            int index = i * d_conv + j;
+            val += conv_state[index] * conv1d_weight[index];
+        }
+        xBC[i] = silu(val + conv1d_bias[i]);
+    }
+}
+
+// Fused Mamba2 SSM step: discretize, update state, compute output with D
+// Combines: dt softplus, dA computation, dBx computation, ssm_state update,
+// y computation with einsum, and D*x addition
+void selective_scan_mamba2(float* y, float* ssm_state, float* dt_raw, float* dt_bias,
+                           float* A, float* B, float* C, float* D, float* x,
+                           int nheads, int headdim, int d_state) {
+    #pragma omp parallel for
+    for (int h = 0; h < nheads; h++) {
+        // dt = softplus(dt_raw + dt_bias)
+        float dt_h = logf(1.0f + expf(dt_raw[h] + dt_bias[h]));
+        // dA = exp(dt * A)
+        float dA_h = expf(dt_h * A[h]);
+        float D_h = D[h];
+
+        for (int p = 0; p < headdim; p++) {
+            int hp_idx = h * headdim + p;
+            float x_hp = x[hp_idx];
+            float dt_x = dt_h * x_hp;
+            float y_hp = 0.0f;
+
+            for (int n = 0; n < d_state; n++) {
+                int state_idx = h * headdim * d_state + p * d_state + n;
+                // dBx = dt * B[n] * x[h,p]
+                float dBx_n = dt_x * B[n];
+                // ssm_state = ssm_state * dA + dBx
+                ssm_state[state_idx] = ssm_state[state_idx] * dA_h + dBx_n;
+                // y += ssm_state * C[n]
+                y_hp += ssm_state[state_idx] * C[n];
+            }
+            // y = y + D * x
+            y[hp_idx] = y_hp + D_h * x_hp;
+        }
     }
 }
 
@@ -442,9 +491,7 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     int headdim = p->headdim, nheads = p->nheads;
     int conv_dim = d_inner + 2 * d_state;
     int d_in_proj = 2 * d_inner + 2 * d_state + nheads;
-    float* dA  = s->dA;   // (nheads)
-    float* dBx = s->dBx;  // (nheads, headdim, d_state)
-    float* y   = s->y;    // (d_inner)
+    float* y = s->y;   // (d_inner)
 
     // Get pointers to this layer's states
     // conv_state: (conv_dim, d_conv) = (d_inner + 2*d_state, d_conv)
@@ -473,31 +520,12 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     float* dt_raw = s->zxbcdt + d_inner + conv_dim; // dt (nheads)
 
     // ========== Convolution Step ==========
-    // Advance convolution input: conv_state = roll(conv_state, shifts=-1, dims=-1)
-    shift_matrix_left(conv_state, conv_dim, d_conv);
-    // conv_state[:, -1] = xBC
-    update_last_column(conv_state, xBC_proj, conv_dim, d_conv);
+    // Fused: shift conv_state left, update last column with xBC_proj, compute conv, add bias, apply silu
+    shift_and_update_last_column(conv_state, xBC_proj, conv_dim, d_conv);
 
-    // xBC = sum(conv_state * conv1d.weight, dim=-1)
-    // conv_state: (conv_dim, d_conv), conv1d_weight: (conv_dim, d_conv)
+    // Fused: conv1d dot product + bias + silu
     float* xBC = s->xBC;
-    #pragma omp parallel for
-    for (int i = 0; i < conv_dim; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < d_conv; j++) {
-            int idx = i * d_conv + j;
-            val += conv_state[idx] * conv1d_weight[idx];
-        }
-        xBC[i] = val;
-    }
-    // xBC = xBC + conv1d.bias
-    for (int i = 0; i < conv_dim; i++) {
-        xBC[i] += conv1d_bias[i];
-    }
-    // xBC = silu(xBC)
-    for (int i = 0; i < conv_dim; i++) {
-        xBC[i] = silu(xBC[i]);
-    }
+    conv1d_silu(xBC, conv_state, conv1d_weight, conv1d_bias, conv_dim, d_conv);
 
     // Split xBC into x (d_inner), B (d_state), C (d_state)
     float* x = s->x;                    // will hold reshaped x (nheads, headdim)
@@ -505,59 +533,13 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     float* C = xBC + d_inner + d_state; // C (d_state)
 
     // Copy x portion (d_inner elements)
-    for (int i = 0; i < d_inner; i++) {
-        x[i] = xBC[i];
-    }
+    memcpy(x, xBC, d_inner * sizeof(float));
 
     // ========== SSM Step ==========
-    // A is pre-converted: A = -exp(A_log)
-    // dt = softplus(dt + dt_bias)  # (nheads)
-    // dA = exp(dt * A)  # (nheads)
-    float* dt = s->dt;
-    for (int h = 0; h < nheads; h++) {
-        dt[h] = softplus(dt_raw[h] + dt_bias[h]);
-        dA[h] = expf(dt[h] * A[h]);
-    }
-
-    // Compute dBx = einsum("h, n, hp -> hpn", dt, B, x)
-    // dBx[h,p,n] = dt[h] * B[n] * x[h,p]
-    #pragma omp parallel for
-    for (int h = 0; h < nheads; h++) {
-        float dt_h = dt[h];
-        for (int p = 0; p < headdim; p++) {
-            float dt_x = dt_h * x[h * headdim + p];
-            for (int n = 0; n < d_state; n++) {
-                dBx[h * headdim * d_state + p * d_state + n] = dt_x * B[n];
-            }
-        }
-    }
-
-    //  Update ssm_state
-    // ssm_state = ssm_state * dA + dBx
-    // dA[h] broadcasts over (headdim, d_state) dimensions
-    // Note: Can't use elementwise_multiply_and_add directly (dA needs per-head broadcast)
-    #pragma omp parallel for
-    for (int h = 0; h < nheads; h++) {
-        float dA_h = dA[h];
-        int h_offset = h * headdim * d_state;
-        for (int i = 0; i < headdim * d_state; i++) {
-            int idx = h_offset + i;
-            ssm_state[idx] = ssm_state[idx] * dA_h + dBx[idx];
-        }
-    }
-
-    //  Compute y
-    // y = torch.einsum("dn,n->d", ssm_state, C) # ssm_state (d_inner, d_state), C (d_state), y (d_inner)
-    rowwise_dot_product(y, ssm_state, C, d_inner, d_state);
-
-    // y = y + D * x  where D is (nheads) and x is (nheads, headdim)
-    // D is broadcast across headdim
-    for (int h = 0; h < nheads; h++) {
-        float D_h = D[h];
-        for (int p = 0; p < headdim; p++) {
-            y[h * headdim + p] += D_h * x[h * headdim + p];
-        }
-    }
+    // Fused operation: dt softplus, dA computation, dBx computation, ssm_state update,
+    // y computation, and D*x addition
+    selective_scan_mamba2(y, ssm_state, dt_raw, dt_bias, A, B, C, D, x,
+                          nheads, headdim, d_state);
 
     // ========== Gated RMSNorm ==========
     // y = norm(y, z) = (y * silu(z)) * rsqrt(mean + eps) * weight

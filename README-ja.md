@@ -6,7 +6,7 @@
 
 <p align="right"><a href="https://github.com/kroggen/mamba.c/blob/learning/README.md">English</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-zh.md">中文</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ru.md">Русский</a></p>
 
-純粋なCでのマンバモデルの推論
+純粋なCでのMamba 1 & 2モデルの推論
 
 [llama2.c](https://github.com/karpathy/llama2.c)からインスピレーションを受け、そのコードを使用しています
 
@@ -78,6 +78,11 @@ python3 export.py . model.bin
 * `learning` - 基本的なもの
 * `fused` - 基本的な機能をより大きなものに統合（[比較](https://github.com/kroggen/mamba.c/compare/learning..fused)することができます）
 * `cuda` - シンプルなGPU実装、理解しやすい
+
+Mamba 2のコードもあります：
+
+* `mamba2-learning` - 非常に基本的（[mamba1と比較](https://github.com/kroggen/mamba.c/compare/learning..mamba2-learning)）
+* `mamba2-fused` - 統合された関数（[learningと比較](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba2-fused) | [mamba1と比較](https://github.com/kroggen/mamba.c/compare/fused..mamba2-fused)）
 
 
 ## ノート

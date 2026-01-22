@@ -6,7 +6,7 @@
 
 <p align="right"><a href="https://github.com/kroggen/mamba.c/blob/learning/README-zh.md">中文</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ja.md">日本語</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ru.md">Русский</a></p>
 
-Inference of Mamba models in pure C
+Inference of Mamba 1 & 2 models in pure C
 
 Inspired by and using code from [llama2.c](https://github.com/karpathy/llama2.c)
 
@@ -79,6 +79,11 @@ The code is available on 3 versions, each on a separate branch:
 * `learning` - very basic
 * `fused` - fuse the basic functions into bigger ones (you can [compare](https://github.com/kroggen/mamba.c/compare/learning..fused) them)
 * `cuda` - simple GPU implementation, easy to understand
+
+There is also code for Mamba 2:
+
+* `mamba2-learning` - very basic ([compare with mamba1](https://github.com/kroggen/mamba.c/compare/learning..mamba2-learning))
+* `mamba2-fused` - fused functions ([compare with learning](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba2-fused) | [compare with mamba1](https://github.com/kroggen/mamba.c/compare/fused..mamba2-fused))
 
 
 ## Notes

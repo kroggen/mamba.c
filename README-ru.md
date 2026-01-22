@@ -6,7 +6,7 @@
 
 <p align="right"><a href="https://github.com/kroggen/mamba.c/blob/learning/README.md">English</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-zh.md">中文</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ja.md">日本語</a></p>
 
-Вывод моделей Mamba на чистом C
+Вывод моделей Mamba 1 & 2 на чистом C
 
 Вдохновлен и использует код из [llama2.c](https://github.com/karpathy/llama2.c)
 
@@ -79,6 +79,11 @@ python3 export.py . model.bin
 * `learning` - очень базовая
 * `fused` - объединение базовых функций в более крупные (вы можете сравнить их)
 * `cuda` - простая реализация на GPU, легкая для понимания
+
+Также доступен код для Mamba 2:
+
+* `mamba2-learning` - очень базовая ([сравнить с mamba1](https://github.com/kroggen/mamba.c/compare/learning..mamba2-learning))
+* `mamba2-fused` - объединённые функции ([сравнить с learning](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba2-fused) | [сравнить с mamba1](https://github.com/kroggen/mamba.c/compare/fused..mamba2-fused))
 
 
 ## Примечания

@@ -219,6 +219,18 @@ void free_model(Mamba* m) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the model
 
+float softplus(float x) {
+    return logf(1.0f + expf(x));
+}
+
+float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+float silu(float x) {
+    return x * sigmoid(x);
+}
+
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
     float ss = 0.0f;
@@ -252,18 +264,6 @@ void softmax(float* x, int size) {
     for (int i = 0; i < size; i++) {
         x[i] /= sum;
     }
-}
-
-float softplus(float x) {
-    return logf(1.0f + expf(x));
-}
-
-float sigmoid(float x) {
-    return 1.0f / (1.0f + expf(-x));
-}
-
-float silu(float x) {
-    return x * sigmoid(x);
 }
 
 void shift_matrix_left(float* matrix, int rows, int cols) {
@@ -383,45 +383,53 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     float* dB = s->dB;  // (d_inner, d_state)
     float* y  = s->y;   // (d_inner)
 
-    // conv_state, ssm_state = self._get_states_from_cache(inference_params)
+    // Get pointers to this layer's states
     float* conv_state = s->conv_state + l * d_inner * d_conv;
     float* ssm_state  = s->ssm_state  + l * d_inner * d_state;
 
+    // Get pointers to this layer's weights
+    float* in_proj       = w->in_proj       + l * 2*d_inner * dim;
+    float* conv1d_weight = w->conv1d_weight + l * d_inner * d_conv;
+    float* conv1d_bias   = w->conv1d_bias   + l * d_inner;
+    float* x_proj        = w->x_proj        + l * (dt_rank+2*d_state) * d_inner;
+    float* dt_proj_weight= w->dt_proj_weight+ l * d_inner * dt_rank;
+    float* dt_proj_bias  = w->dt_proj_bias  + l * d_inner;
+    float* A             = w->A             + l * d_inner * d_state;
+    float* D             = w->D             + l * d_inner;
+    float* out_proj      = w->out_proj      + l * dim * d_inner;
+
+    // ========== Input Projection ==========
     // xz = self.in_proj(hidden_states)  # hidden_states: (dim), in_proj (2*d_inner, dim), xz (2*d_inner)
-    matmul(s->xz, hidden_state, w->in_proj + l * 2*d_inner*dim, 2*d_inner, dim);
+    matmul(s->xz, hidden_state, in_proj, 2*d_inner, dim);
     // x, z = xz.chunk(2, dim=-1)
     float* x = s->xz;            // x (d_inner)
     float* z = s->xz + d_inner;  // z (d_inner)
 
-
-    // Conv step
-
+    // ========== Convolution Step ==========
     // conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
     shift_matrix_left(conv_state, d_inner, d_conv);
     // conv_state[:, -1] = x
     update_last_column(conv_state, x, d_inner, d_conv);
     // x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
-    elementwise_multiply(s->temp, conv_state, w->conv1d_weight + l*d_inner*d_conv, d_inner * d_conv);
+    elementwise_multiply(s->temp, conv_state, conv1d_weight, d_inner * d_conv);
     sum_along_last_dim(x, s->temp, d_inner, d_conv);
     // x = x + self.conv1d.bias
-    elementwise_add(x, x, w->conv1d_bias + l*d_inner, d_inner);
+    elementwise_add(x, x, conv1d_bias, d_inner);
     // x = F.silu(x)
     for (int i = 0; i < d_inner; i++) {
         x[i] = silu(x[i]);
     }
 
-
-    // SSM step
-
+    // ========== SSM Step ==========
     // x_db = self.x_proj(x)   # x_db (dt_rank+2*d_state)
-    matmul(s->x_db, x, w->x_proj + l*(dt_rank+2*d_state)*d_inner, dt_rank+2*d_state, d_inner);
+    matmul(s->x_db, x, x_proj, dt_rank+2*d_state, d_inner);
     // dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
     float *dt = s->x_db;                     // dt (dt_rank)
     float *B = s->x_db + dt_rank;            // B  (d_state)
     float *C = s->x_db + dt_rank + d_state;  // C  (d_state)
 
     // dt = self.dt_proj(dt)   # dt (dt_rank), dt_proj_weight (d_inner, dt_rank), dt_proj_bias (d_inner)
-    linear(s->dt, dt, w->dt_proj_weight + l*d_inner*dt_rank, w->dt_proj_bias + l*d_inner, d_inner, dt_rank);
+    linear(s->dt, dt, dt_proj_weight, dt_proj_bias, d_inner, dt_rank);
     dt = s->dt;  // NOTE: dt is now bigger: (d_inner) instead of (dt_rank)
     // dt = F.softplus(dt)
     for (int i = 0; i < d_inner; i++) {
@@ -430,7 +438,7 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
 
     //  Discretize A and B
     // dA = torch.exp(torch.einsum("d,dn->dn", dt, self.A))   # A (d_inner, d_state), dA (d_inner, d_state)
-    broadcast_multiply(dA, dt, w->A + l*d_inner*d_state, d_inner, d_state);
+    broadcast_multiply(dA, dt, A, d_inner, d_state);
     for (int i = 0; i < d_inner * d_state; i++) {
         dA[i] = expf(dA[i]);
     }
@@ -446,14 +454,15 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     // y = torch.einsum("dn,n->d", ssm_state, C) # ssm_state (d_inner, d_state), C (d_state), y (d_inner)
     rowwise_dot_product(y, ssm_state, C, d_inner, d_state);
     // y = y + self.D * x
-    elementwise_multiply_and_add(y, w->D + l*d_inner, x, y, d_inner);
+    elementwise_multiply_and_add(y, D, x, y, d_inner);
     // y = y * F.silu(z)  # (d_inner)
     for (int i = 0; i < d_inner; i++) {
         y[i] = y[i] * silu(z[i]);
     }
 
+    // ========== Output Projection ==========
     // hidden_state = self.out_proj(y)  # out_proj (dim, d_inner), hidden_state (dim)
-    matmul(hidden_state, y, w->out_proj + l*dim*d_inner, dim, d_inner);
+    matmul(hidden_state, y, out_proj, dim, d_inner);
 }
 
 float* forward(Mamba* mamba, int token) {

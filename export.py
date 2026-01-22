@@ -11,9 +11,9 @@ import torch
 
 def serialize_fp32(file, tensor):
     """ writes one fp32 tensor to file that is open in wb mode """
-    d = tensor.detach().cpu().view(-1).to(torch.float32).numpy()
-    b = struct.pack(f'{len(d)}f', *d)
-    file.write(b)
+    t = tensor.detach().cpu().contiguous().view(-1).to(torch.float32)
+    # Use torch's storage to get raw bytes directly
+    file.write(t.numpy().tobytes())
 
 # -----------------------------------------------------------------------------
 # model export functions
@@ -31,31 +31,56 @@ def write_layer_weights(file, model, layer, n_layers):
 
 def model_export(model, config, filepath):
     """
-    Export the model weights in full float32 .bin file to be read from C.
+    Export the Mamba2 model weights in full float32 .bin file to be read from C.
     """
-    version = 1
+    version = 2
 
     out_file = open(filepath, 'wb')
 
     # first write the header (256 bytes)
 
-    # write magic, uint32 of "Mamb"
-    out_file.write(struct.pack('I', 0x4d616d62))
+    # write magic, uint32 of "Mmb2" (Mamba2)
+    out_file.write(struct.pack('I', 0x4d6d6232))
     # write version
     out_file.write(struct.pack('i', version))
 
-    # write the params (7 integers + 1 byte)
-    d_inner = model['layers.0.mixer.D'].shape[0]
-    dt_rank = model['layers.0.mixer.dt_proj.weight'].shape[1]
-    d_state = model['layers.0.mixer.A_log'].shape[1]
-    d_conv = model['layers.0.mixer.conv1d.weight'].shape[2]
+    # Mamba2 config extraction - infer from model weights if not in config
+    d_model = config.d_model
+    n_layers = config.n_layer
+    vocab_size = config.vocab_size
 
-    shared_classifier = torch.equal(model['embedding.weight'], model['lm_head.weight'])
+    # Infer parameters from model weights
+    # nheads from A_log shape
+    nheads = model['backbone.layers.0.mixer.A_log'].shape[0]
+    # d_inner from out_proj or norm.weight
+    d_inner = model['backbone.layers.0.mixer.norm.weight'].shape[0]
+    # headdim = d_inner / nheads
+    headdim = d_inner // nheads
+    # conv_dim from conv1d.weight, d_state = (conv_dim - d_inner) / 2
+    conv_dim = model['backbone.layers.0.mixer.conv1d.weight'].shape[0]
+    d_state = (conv_dim - d_inner) // 2
+    # d_conv from conv1d.weight
+    d_conv = model['backbone.layers.0.mixer.conv1d.weight'].shape[2]
 
-    print(f"writing header\n  layers: {config.n_layers}\n  vocab_size: {config.vocab_size}\n  d_model: {config.d_model}\n  d_inner: {d_inner}\n  dt_rank: {dt_rank}\n  d_state: {d_state}\n  d_conv: {d_conv}\n  shared classifier: {shared_classifier}")
+    d_in_proj = 2 * d_inner + 2 * d_state + nheads
 
-    header = struct.pack('iiiiiiii', config.n_layers, config.vocab_size, config.d_model,
-                         d_inner, dt_rank, d_state, d_conv, int(shared_classifier))
+    shared_classifier = torch.equal(model['backbone.embedding.weight'], model['lm_head.weight'])
+
+    print(f"writing header")
+    print(f"  n_layers: {n_layers}")
+    print(f"  vocab_size: {vocab_size}")
+    print(f"  d_model (dim): {d_model}")
+    print(f"  d_inner: {d_inner}")
+    print(f"  d_state: {d_state}")
+    print(f"  d_conv: {d_conv}")
+    print(f"  headdim: {headdim}")
+    print(f"  nheads: {nheads}")
+    print(f"  shared classifier: {shared_classifier}")
+
+    # write the params: n_layers, vocab_size, dim, d_inner, d_state, d_conv, headdim, shared_classifier
+    # Note: nheads is computed (d_inner / headdim), rounded_vocab_size is computed
+    header = struct.pack('iiiiiiii', n_layers, vocab_size, d_model,
+                         d_inner, d_state, d_conv, headdim, int(shared_classifier))
     out_file.write(header)
 
     # pad the rest with zeros
@@ -64,45 +89,50 @@ def model_export(model, config, filepath):
     out_file.write(b'\0' * pad)
 
     '''
-    Example of the model structure:
-    embedding.weight - [50280, 768]
-    layers.0.mixer.D - [1536]
-    layers.0.mixer.in_proj.weight - [3072, 768]
-    layers.0.mixer.conv1d.weight - [1536, 1, 4]
-    layers.0.mixer.conv1d.bias - [1536]
-    layers.0.mixer.x_proj.weight - [80, 1536]
-    layers.0.mixer.dt_proj.weight - [1536, 48]
-    layers.0.mixer.dt_proj.bias - [1536]
-    layers.0.mixer.A_log - [1536, 16]
-    layers.0.mixer.out_proj.weight - [768, 1536]
-    layers.0.norm.weight - [768]
-    norm_f.weight - [768]
-    lm_head.weight - [50280, 768]
+    Mamba2 model structure example:
+    backbone.embedding.weight - [vocab_size, d_model]
+    backbone.layers.0.mixer.in_proj.weight - [d_in_proj, d_model]
+    backbone.layers.0.mixer.conv1d.weight - [conv_dim, 1, d_conv]
+    backbone.layers.0.mixer.conv1d.bias - [conv_dim]
+    backbone.layers.0.mixer.dt_bias - [nheads]
+    backbone.layers.0.mixer.A_log - [nheads]
+    backbone.layers.0.mixer.D - [nheads]
+    backbone.layers.0.mixer.norm.weight - [d_inner]
+    backbone.layers.0.mixer.out_proj.weight - [d_model, d_inner]
+    backbone.layers.0.norm.weight - [d_model]
+    backbone.norm_f.weight - [d_model]
+    lm_head.weight - [vocab_size, d_model]
     '''
 
-    # convert the A_log to A
-    for n in range(config.n_layers):
-        model[f'layers.{n}.mixer.A'] = -torch.exp(model.pop(f'layers.{n}.mixer.A_log'))
+    # Convert A_log to A = -exp(A_log) for faster inference
+    for n in range(n_layers):
+        A_log = model.pop(f'backbone.layers.{n}.mixer.A_log').float()  # convert to float32
+        model[f'backbone.layers.{n}.mixer.A'] = -torch.exp(A_log)
 
     # write the weights
 
     # write the embedding weights
-    write_weights(out_file, model, 'embedding.weight')
+    write_weights(out_file, model, 'backbone.embedding.weight')
 
     # layer weights
-    write_layer_weights(out_file, model, 'layers.%d.mixer.in_proj.weight', config.n_layers)
-    write_layer_weights(out_file, model, 'layers.%d.mixer.conv1d.weight', config.n_layers)
-    write_layer_weights(out_file, model, 'layers.%d.mixer.conv1d.bias', config.n_layers)
-    write_layer_weights(out_file, model, 'layers.%d.mixer.x_proj.weight', config.n_layers)
-    write_layer_weights(out_file, model, 'layers.%d.mixer.dt_proj.weight', config.n_layers)
-    write_layer_weights(out_file, model, 'layers.%d.mixer.dt_proj.bias', config.n_layers)
-    write_layer_weights(out_file, model, 'layers.%d.mixer.A', config.n_layers)
-    write_layer_weights(out_file, model, 'layers.%d.mixer.D', config.n_layers)
-    write_layer_weights(out_file, model, 'layers.%d.mixer.out_proj.weight', config.n_layers)
-    write_layer_weights(out_file, model, 'layers.%d.norm.weight', config.n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.in_proj.weight', n_layers)
+
+    # conv1d weight needs reshaping: (conv_dim, 1, d_conv) -> (conv_dim, d_conv)
+    for n in range(n_layers):
+        conv_weight = model[f'backbone.layers.{n}.mixer.conv1d.weight'].squeeze(1)
+        print(f"writing backbone.layers.{n}.mixer.conv1d.weight {list(conv_weight.shape)[::-1]}")
+        serialize_fp32(out_file, conv_weight)
+
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.conv1d.bias', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.dt_bias', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.A', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.D', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.norm.weight', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.out_proj.weight', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.norm.weight', n_layers)
 
     # final norm weights
-    write_weights(out_file, model, 'norm_f.weight')
+    write_weights(out_file, model, 'backbone.norm_f.weight')
 
     # final classifier weights
     if not shared_classifier:
@@ -122,15 +152,16 @@ def load_model(path):
     # load the model
     if os.path.isdir(path):
         filepath = os.path.join(path, 'pytorch_model.bin')
+        if not os.path.exists(filepath):
+            filepath = os.path.join(path, 'model.safetensors')
     else:
         filepath = path
-    model = torch.load(filepath, map_location='cpu')
 
-    # remove the 'backbone.' prefix from the keys
-    unwanted_prefix = 'backbone.'
-    for k,v in list(model.items()):
-        if k.startswith(unwanted_prefix):
-            model[k[len(unwanted_prefix):]] = model.pop(k)
+    if filepath.endswith('.safetensors'):
+        from safetensors.torch import load_file
+        model = load_file(filepath)
+    else:
+        model = torch.load(filepath, map_location='cpu')
 
     # get the path to the config file
     if os.path.isdir(path):
@@ -140,30 +171,24 @@ def load_model(path):
     # load the config
     with open(config_path) as f:
         config = json.load(f)
-    # rename config.n_layers to config.n_layers
-    config['n_layers'] = config.pop('n_layer')
-    config = argparse.Namespace(**config)    
+    config = argparse.Namespace(**config)
 
     return model, config
 
 
 def get_model_from_huggingface(model_name: str):
-    """Download model from HuggingFace and get the path to the model file.
+    """Download model from HuggingFace and get the path to the model directory.
     The model name can be one of the following:
-        'state-spaces/mamba-130m'
-        'state-spaces/mamba-370m'
-        'state-spaces/mamba-790m'
-        'state-spaces/mamba-1.4b'
-        'state-spaces/mamba-2.8b'
-        'state-spaces/mamba-2.8b-slimpj'
+        'state-spaces/mamba2-130m'
+        'state-spaces/mamba2-370m'
+        'state-spaces/mamba2-780m'
+        'state-spaces/mamba2-1.3b'
+        'state-spaces/mamba2-2.7b'
     """
-    from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
-    from transformers.utils.hub import cached_file
+    from huggingface_hub import snapshot_download
 
-    config_path = cached_file(model_name, CONFIG_NAME, _raise_exceptions_for_missing_entries=False)
-    model_path = cached_file(model_name, WEIGHTS_NAME, _raise_exceptions_for_missing_entries=False)
-
-    return model_path
+    local_dir = snapshot_download(repo_id=model_name)
+    return local_dir
 
 # -----------------------------------------------------------------------------
 # CLI entrypoint
@@ -171,12 +196,12 @@ def get_model_from_huggingface(model_name: str):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("source", type=str, help="model name or folder where the model files are located", default="state-spaces/mamba-130m")
+    parser.add_argument("source", type=str, help="model name or folder where the model files are located", default="state-spaces/mamba2-130m")
     parser.add_argument("destination", type=str, help="full path to the output file", default="model.bin")
     args = parser.parse_args()
 
-    # if the source starts with 'state-spaces/mamba-' then load the model from HuggingFace
-    if args.source.startswith('state-spaces/mamba-'):
+    # if the source starts with 'state-spaces/mamba2-' then load the model from HuggingFace
+    if args.source.startswith('state-spaces/mamba2-'):
         model_path = get_model_from_huggingface(args.source)
     else:
         model_path = args.source

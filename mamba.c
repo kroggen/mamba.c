@@ -210,6 +210,18 @@ void free_model(Mamba* m) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the model
 
+float softplus(float x) {
+    return logf(1.0f + expf(x));
+}
+
+float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+float silu(float x) {
+    return x * sigmoid(x);
+}
+
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
     float ss = 0.0f;
@@ -243,18 +255,6 @@ void softmax(float* x, int size) {
     for (int i = 0; i < size; i++) {
         x[i] /= sum;
     }
-}
-
-float softplus(float x) {
-    return logf(1.0f + expf(x));
-}
-
-float sigmoid(float x) {
-    return 1.0f / (1.0f + expf(-x));
-}
-
-float silu(float x) {
-    return x * sigmoid(x);
 }
 
 void shift_matrix_left(float* matrix, int rows, int cols) {
@@ -434,19 +434,29 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     int dim = p->dim, d_inner = p->d_inner, d_conv = p->d_conv, d_state = p->d_state, dt_rank = p->dt_rank;
     float* y  = s->y;   // (d_inner)
 
-    // conv_state, ssm_state = self._get_states_from_cache(inference_params)
+    // Get pointers to this layer's states
     float* conv_state = s->conv_state + l * d_inner * d_conv;
     float* ssm_state  = s->ssm_state  + l * d_inner * d_state;
 
+    // Get pointers to this layer's weights
+    float* in_proj       = w->in_proj       + l * 2*d_inner * dim;
+    float* conv1d_weight = w->conv1d_weight + l * d_inner * d_conv;
+    float* conv1d_bias   = w->conv1d_bias   + l * d_inner;
+    float* x_proj        = w->x_proj        + l * (dt_rank+2*d_state) * d_inner;
+    float* dt_proj_weight= w->dt_proj_weight+ l * d_inner * dt_rank;
+    float* dt_proj_bias  = w->dt_proj_bias  + l * d_inner;
+    float* A             = w->A             + l * d_inner * d_state;
+    float* D             = w->D             + l * d_inner;
+    float* out_proj      = w->out_proj      + l * dim * d_inner;
+
+    // ========== Input Projection ==========
     // xz = self.in_proj(hidden_states)  # hidden_states: (dim), in_proj (2*d_inner, dim), xz (2*d_inner)
-    matmul(s->xz, hidden_state, w->in_proj + l * 2*d_inner*dim, 2*d_inner, dim);
+    matmul(s->xz, hidden_state, in_proj, 2*d_inner, dim);
     // x, z = xz.chunk(2, dim=-1)
     float* x = s->xz;            // x (d_inner)
     float* z = s->xz + d_inner;  // z (d_inner)
 
-
-    // Conv step
-
+    // ========== Convolution Step ==========
     // conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
     // conv_state[:, -1] = x
     shift_and_update_last_column(conv_state, x, d_inner, d_conv);
@@ -454,13 +464,11 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     // x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
     // x = x + self.conv1d.bias
     // x = F.silu(x)
-    conv1d_silu(x, conv_state, w->conv1d_weight + l*d_inner*d_conv, w->conv1d_bias + l*d_inner, d_inner, d_conv);
+    conv1d_silu(x, conv_state, conv1d_weight, conv1d_bias, d_inner, d_conv);
 
-
-    // SSM step
-
+    // ========== SSM Step ==========
     // x_db = self.x_proj(x)   # x_db (dt_rank+2*d_state)
-    matmul(s->x_db, x, w->x_proj + l*(dt_rank+2*d_state)*d_inner, dt_rank+2*d_state, d_inner);
+    matmul(s->x_db, x, x_proj, dt_rank+2*d_state, d_inner);
     // dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
     float *dt = s->x_db;                     // dt (dt_rank)
     float *B = s->x_db + dt_rank;            // B  (d_state)
@@ -468,7 +476,7 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
 
     // dt = self.dt_proj(dt)   # dt (dt_rank), dt_proj_weight (d_inner, dt_rank), dt_proj_bias (d_inner)
     // dt = F.softplus(dt)
-    dense_softplus(s->dt, dt, w->dt_proj_weight + l*d_inner*dt_rank, w->dt_proj_bias + l*d_inner, d_inner, dt_rank);
+    dense_softplus(s->dt, dt, dt_proj_weight, dt_proj_bias, d_inner, dt_rank);
     dt = s->dt;  // NOTE: dt is now bigger: (d_inner) instead of (dt_rank)
 
     //  Discretize A and B
@@ -480,10 +488,11 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     // y = torch.einsum("dn,n->d", ssm_state, C) # ssm_state (d_inner, d_state), C (d_state), y (d_inner)
     // y = y + self.D * x
     // y = y * F.silu(z)  # (d_inner)
-    selective_scan(y, ssm_state, dt, w->A + l*d_inner*d_state, B, C, w->D + l*d_inner, x, z, d_inner, d_state);
+    selective_scan(y, ssm_state, dt, A, B, C, D, x, z, d_inner, d_state);
 
+    // ========== Output Projection ==========
     // hidden_state = self.out_proj(y)  # out_proj (dim, d_inner), hidden_state (dim)
-    matmul(hidden_state, y, w->out_proj + l*dim*d_inner, dim, d_inner);
+    matmul(hidden_state, y, out_proj, dim, d_inner);
 }
 
 float* forward(Mamba* mamba, int token) {

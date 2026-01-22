@@ -22,7 +22,7 @@
 
 ```
 python3 tokenizer.py
-python3 export.py state-spaces/mamba-130m model.bin
+python3 export.py state-spaces/mamba2-130m model.bin
 make fast
 ./mamba model.bin -n 20 -i "Customer Support should" -t 0.0
 ```
@@ -32,14 +32,13 @@ Pythonは、トークン化器とモデルをよりシンプルな形式にエ�
 
 ## モデル
 
-[HuggingFace](https://huggingface.co/state-spaces)に保存されているこれらのモデルを使用することができます：
+[HuggingFace](https://huggingface.co/state-spaces)に保存されているこれらのMamba 2モデルを使用することができます：
 
-* `state-spaces/mamba-130m`
-* `state-spaces/mamba-370m`
-* `state-spaces/mamba-790m`
-* `state-spaces/mamba-1.4b`
-* `state-spaces/mamba-2.8b`
-* `state-spaces/mamba-2.8b-slimpj`
+* `state-spaces/mamba2-130m`
+* `state-spaces/mamba2-370m`
+* `state-spaces/mamba2-780m`
+* `state-spaces/mamba2-1.3b`
+* `state-spaces/mamba2-2.7b`
 
 モデル名を`export.py`スクリプトの引数として指定することができます
 
@@ -48,8 +47,8 @@ Pythonは、トークン化器とモデルをよりシンプルな形式にエ�
 オプションとして、手動でダウンロードした場合はモデルファイルへのパスも指定できます。例：
 
 ```
-wget https://huggingface.co/state-spaces/mamba-130m/resolve/main/config.json?download=true -O config.json
-wget https://huggingface.co/state-spaces/mamba-130m/resolve/main/pytorch_model.bin?download=true -O pytorch_model.bin
+wget https://huggingface.co/state-spaces/mamba2-130m/resolve/main/config.json?download=true -O config.json
+wget https://huggingface.co/state-spaces/mamba2-130m/resolve/main/pytorch_model.bin?download=true -O pytorch_model.bin
 python3 export.py . model.bin
 ```
 

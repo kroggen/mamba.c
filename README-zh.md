@@ -22,7 +22,7 @@
 
 ```
 python3 tokenizer.py
-python3 export.py state-spaces/mamba-130m model.bin
+python3 export.py state-spaces/mamba2-130m model.bin
 make fast
 ./mamba model.bin -n 20 -i "Customer Support should" -t 0.0
 ```
@@ -32,14 +32,13 @@ Python仅用于将分词器和模型导出为更简单的格式（需要transfor
 
 ## 模型
 
-您可以使用存储在[HuggingFace](https://huggingface.co/state-spaces)上的这些模型：
+您可以使用存储在[HuggingFace](https://huggingface.co/state-spaces)上的这些Mamba 2模型：
 
-* `state-spaces/mamba-130m`
-* `state-spaces/mamba-370m`
-* `state-spaces/mamba-790m`
-* `state-spaces/mamba-1.4b`
-* `state-spaces/mamba-2.8b`
-* `state-spaces/mamba-2.8b-slimpj`
+* `state-spaces/mamba2-130m`
+* `state-spaces/mamba2-370m`
+* `state-spaces/mamba2-780m`
+* `state-spaces/mamba2-1.3b`
+* `state-spaces/mamba2-2.7b`
 
 您可以将模型名称作为`export.py`脚本的参数
 
@@ -48,8 +47,8 @@ Python仅用于将分词器和模型导出为更简单的格式（需要transfor
 您也可以选择指定模型文件的路径，如果您手动下载了它。例如：
 
 ```
-wget https://huggingface.co/state-spaces/mamba-130m/resolve/main/config.json?download=true -O config.json
-wget https://huggingface.co/state-spaces/mamba-130m/resolve/main/pytorch_model.bin?download=true -O pytorch_model.bin
+wget https://huggingface.co/state-spaces/mamba2-130m/resolve/main/config.json?download=true -O config.json
+wget https://huggingface.co/state-spaces/mamba2-130m/resolve/main/pytorch_model.bin?download=true -O pytorch_model.bin
 python3 export.py . model.bin
 ```
 

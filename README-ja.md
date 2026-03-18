@@ -6,7 +6,7 @@
 
 <p align="right"><a href="https://github.com/kroggen/mamba.c/blob/learning/README.md">English</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-zh.md">中文</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ru.md">Русский</a></p>
 
-純粋なCでのMamba 1 & 2モデルの推論
+純粋なCでのMamba 1、2 & 3モデルの推論
 
 [llama2.c](https://github.com/karpathy/llama2.c)からインスピレーションを受け、そのコードを使用しています
 
@@ -20,36 +20,34 @@
 
 ## 早速始める
 
+Mamba-3モデルの重みが公開されたら（[モデル](#モデル)を参照）：
+
 ```
 python3 tokenizer.py
-python3 export.py state-spaces/mamba2-130m model.bin
+python3 export.py state-spaces/mamba3-130m model.bin
 make fast
 ./mamba model.bin -n 20 -i "Customer Support should" -t 0.0
 ```
 Pythonは、トークン化器とモデルをよりシンプルな形式にエクスポートするためにのみ使用されます（transformersとpytorchが必要です）
 
-エクスポート部分で別のモデルを選択することができます
-
 ## モデル
 
-[HuggingFace](https://huggingface.co/state-spaces)に保存されているこれらのMamba 2モデルを使用することができます：
+> **注:** 2026年3月現在、Mamba-3モデルの重みはまだ公開されていません。
+> 論文（[arXiv:2603.15569](https://arxiv.org/abs/2603.15569)）は2026年3月16日に投稿されました。
+> [state-spaces](https://huggingface.co/state-spaces) HuggingFace組織は現在、Mamba-1とMamba-2のチェックポイントのみをホストしています。
+> 将来のMamba-3リリースについてはそのページをご確認ください。
 
-* `state-spaces/mamba2-130m`
-* `state-spaces/mamba2-370m`
-* `state-spaces/mamba2-780m`
-* `state-spaces/mamba2-1.3b`
-* `state-spaces/mamba2-2.7b`
-
-モデル名を`export.py`スクリプトの引数として指定することができます
-
-エクスポートスクリプトは、モデルを（まだダウンロードされていない場合）hugingfaceのキャッシュディレクトリにダウンロードします。
-
-オプションとして、手動でダウンロードした場合はモデルファイルへのパスも指定できます。例：
+重みが利用可能になったら、エクスポートスクリプトは`mamba3.py`で使用される`backbone.layers.N.mixer.*` / `backbone.layers.N.mlp.*`レイアウトの標準的なHuggingFaceチェックポイントを期待します。
+その後、以下を実行できます：
 
 ```
-wget https://huggingface.co/state-spaces/mamba2-130m/resolve/main/config.json?download=true -O config.json
-wget https://huggingface.co/state-spaces/mamba2-130m/resolve/main/pytorch_model.bin?download=true -O pytorch_model.bin
-python3 export.py . model.bin
+python3 export.py state-spaces/mamba3-130m model.bin
+```
+
+または手動で：
+
+```
+python3 export.py /path/to/local/mamba3-model model.bin
 ```
 
 ## 内部状態
@@ -82,6 +80,19 @@ Mamba 2のコードもあります：
 
 * `mamba2-learning` - 非常に基本的（[mamba1と比較](https://github.com/kroggen/mamba.c/compare/learning..mamba2-learning)）
 * `mamba2-fused` - 統合された関数（[learningと比較](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba2-fused) | [mamba1と比較](https://github.com/kroggen/mamba.c/compare/fused..mamba2-fused)）
+
+そしてMamba 3（ICLR 2026）の場合：
+
+* `mamba3-learning` - 非常に基本的（[mamba2と比較](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba3-learning)）
+* `mamba3-fused` - 統合された関数（[learningと比較](https://github.com/kroggen/mamba.c/compare/mamba3-learning..mamba3-fused) | [mamba2と比較](https://github.com/kroggen/mamba.c/compare/mamba2-fused..mamba3-fused)）
+
+Mamba-3の主な変更点（Mamba-2との比較）：
+- **台形離散化**: `h_t = α*h_{t-1} + β*B̄_{t-1}x_{t-1} + γ*B̄_t*x_t`（`prev_Bx`の追跡が必要）
+- **データ依存RoPE**: BとCは、入力θとステップサイズΔから導出された累積角度によって回転されます
+- **QK正規化**: 投影後にBとCに適用されるRMSNorm（ゲート付きRMSNorm出力ノルムを置き換え）
+- **学習可能なBCバイアス**: QK-norm後にBとCに追加されるヘッド固有のバイアス、1で初期化
+- **短い畳み込みなし**: 台形則 + バイアスによりconv1dが不要
+- **Llamaスタイルのアーキテクチャ**: 各レイヤーは`RMSNorm → SSM → 残差 → RMSNorm → SwiGLU MLP → 残差`
 
 
 ## ノート

@@ -6,7 +6,7 @@
 
 <p align="right"><a href="https://github.com/kroggen/mamba.c/blob/learning/README-zh.md">中文</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ja.md">日本語</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ru.md">Русский</a></p>
 
-Inference of Mamba 1 & 2 models in pure C
+Inference of Mamba 1, 2 & 3 models in pure C
 
 Inspired by and using code from [llama2.c](https://github.com/karpathy/llama2.c)
 
@@ -21,36 +21,35 @@ Even so, it is faster than pytorch on CPU!!!
 
 ## Fast Start
 
+Once Mamba-3 model weights are publicly released (see [Models](#models) below):
+
 ```
 python3 tokenizer.py
-python3 export.py state-spaces/mamba2-130m model.bin
+python3 export.py state-spaces/mamba3-130m model.bin
 make fast
 ./mamba model.bin -n 20 -i "Customer Support should" -t 0.0
 ```
 Python is only used to export the tokenizer and the model to a simpler format (requires transformers and pytorch)
 
-You can select another model on the export part
-
 ## Models
 
-You can use these Mamba 2 models stored on [HuggingFace](https://huggingface.co/state-spaces):
+> **Note:** As of March 2026, no Mamba-3 model weights have been publicly released yet.
+> The paper ([arXiv:2603.15569](https://arxiv.org/abs/2603.15569)) was submitted on March 16, 2026.
+> The [state-spaces](https://huggingface.co/state-spaces) HuggingFace org currently only hosts Mamba-1 and Mamba-2 checkpoints.
+> Watch that page for future Mamba-3 releases.
 
-* `state-spaces/mamba2-130m`
-* `state-spaces/mamba2-370m`
-* `state-spaces/mamba2-780m`
-* `state-spaces/mamba2-1.3b`
-* `state-spaces/mamba2-2.7b`
-
-You can specify the model name as an argument to the `export.py` script
-
-Note that the export script will download the model (if it's not already downloaded) to the hugingface cache directory.
-
-Optionally you can also specify the path to the model file, if you downloaded it manually. Example:
+When weights become available, the export script expects a standard HuggingFace checkpoint with the
+`backbone.layers.N.mixer.*` / `backbone.layers.N.mlp.*` layout used in `mamba3.py`.
+You can then run:
 
 ```
-wget https://huggingface.co/state-spaces/mamba2-130m/resolve/main/config.json?download=true -O config.json
-wget https://huggingface.co/state-spaces/mamba2-130m/resolve/main/pytorch_model.bin?download=true -O pytorch_model.bin
-python3 export.py . model.bin
+python3 export.py state-spaces/mamba3-130m model.bin
+```
+
+Or manually:
+
+```
+python3 export.py /path/to/local/mamba3-model model.bin
 ```
 
 ## Internal State
@@ -83,6 +82,18 @@ There is also code for Mamba 2:
 
 * `mamba2-learning` - very basic ([compare with mamba1](https://github.com/kroggen/mamba.c/compare/learning..mamba2-learning))
 * `mamba2-fused` - fused functions ([compare with learning](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba2-fused) | [compare with mamba1](https://github.com/kroggen/mamba.c/compare/fused..mamba2-fused))
+
+And for Mamba 3 (ICLR 2026):
+
+* `mamba3-learning` - very basic ([compare with mamba2](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba3-learning))
+
+Mamba-3 key changes vs Mamba-2:
+- **Trapezoidal discretization**: `h_t = α*h_{t-1} + β*B̄_{t-1}x_{t-1} + γ*B̄_t*x_t` (requires tracking `prev_Bx`)
+- **Data-dependent RoPE**: B and C are rotated by cumulative angles derived from input θ and step size Δ
+- **QK-normalization**: RMSNorm applied to B and C after projection (replaces the gated RMSNorm output norm)
+- **Learnable BC bias**: head-specific bias added to B and C after QK-norm, initialized to ones
+- **No short convolution**: the trapezoidal rule + bias makes conv1d unnecessary
+- **Llama-style architecture**: each layer is `RMSNorm → SSM → residual → RMSNorm → SwiGLU MLP → residual`
 
 
 ## Notes

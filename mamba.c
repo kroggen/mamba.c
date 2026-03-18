@@ -1,4 +1,4 @@
-/* Inference for Mamba-2 model in pure C */
+/* Inference for Mamba-3 model in pure C */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,67 +13,88 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+
 // ----------------------------------------------------------------------------
-// Mamba-2 model
+// Mamba-3 model
+//
+// Key innovations over Mamba-2 (ICLR 2026, arXiv:2603.15569):
+//   1) Trapezoidal discretization (Prop. 1, Eq. 4):
+//        h_t = α_t * h_{t-1} + β_t * B̄_{t-1}x_{t-1} + γ_t * B̄_t * x_t
+//   2) Data-dependent RoPE on B, C (complex SSM via rotation, Prop. 3-4)
+//   3) QK-normalization on B and C (RMSNorm, replaces post-SSD norm)
+//   4) Learnable BC bias (head-specific, initialized to ones, Appendix G)
+//   5) No short convolution (trapezoidal + bias makes conv1d unnecessary)
+//   6) Llama-style architecture: RMSNorm → SSM → residual → RMSNorm → SwiGLU MLP → residual
 
 typedef struct {
-    int n_layers;   // number of layers
-    int vocab_size; // vocabulary size
-    int dim;        // embedding dimension (D)
-    int d_inner;    // inner dimension (E * D where E is expand factor)
-    int d_state;    // state dimension (N)
-    int d_conv;     // convolution kernel size
-    int headdim;    // head dimension (P)
-    int nheads;     // number of heads (d_inner / headdim)
+    int n_layers;    // number of layers (each = SSM mixer + SwiGLU MLP)
+    int vocab_size;  // vocabulary size
+    int dim;         // model dimension (D)
+    int d_inner;     // inner dimension (expand * dim, E=2 typically)
+    int d_state;     // SSM state dimension (N), must be even for RoPE
+    int headdim;     // head dimension (P)
+    int nheads;      // number of heads = d_inner / headdim
+    int d_mlp_inner; // SwiGLU MLP inner dimension (~8/3 * dim, rounded to 256)
     int shared_classifier;
-    int rounded_vocab_size; // vocab_size rounded up to the nearest multiple of 8
+    int rounded_vocab_size;
 } Config;
 
 typedef struct {
     // token embedding table
     float* token_embedding_table; // (rounded_vocab_size, dim)
-    // weights for layers
-    // Mamba2: in_proj projects to (z, xBC, dt) combined
-    // d_in_proj = 2*d_inner + 2*d_state + nheads
-    float* in_proj;        // (layer, 2*d_inner + 2*d_state + nheads, dim)
-    // Mamba2: conv applies to xBC (x concatenated with B and C)
-    float* conv1d_weight;  // (layer, d_inner + 2*d_state, d_conv)
-    float* conv1d_bias;    // (layer, d_inner + 2*d_state)
-    // Mamba2: dt_bias directly added to dt (no dt_proj)
-    float* dt_bias;        // (layer, nheads)
-    // Mamba2: A is per-head (pre-converted from A_log: A = -exp(A_log))
-    float* A;              // (layer, nheads)
-    // Mamba2: D is per-head
-    float* D;              // (layer, nheads)
-    // Mamba2: norm weight for gated RMSNorm inside mixer
-    float* inner_norm;     // (layer, d_inner)
-    float* out_proj;       // (layer, dim, d_inner)
-    float* norm;           // (layer, dim)
-    // final rmsnorm
-    float* final_norm;     // (dim)
-    // (optional) classifier weights for the logits, on the last layer
-    float* lm_head;        // (rounded_vocab_size, dim)
+    // SSM mixer weights (per layer)
+    float* mixer_norm; // (layer, dim) — pre-norm before SSM mixer
+    // Mamba3: in_proj projects to (z, x, B, C, dt, lam, theta)
+    //   z:     d_inner
+    //   x:     d_inner
+    //   B:     d_state  (shared across heads before bias broadcast)
+    //   C:     d_state
+    //   dt:    nheads
+    //   lam:   nheads   (trapezoidal interpolation parameter λ)
+    //   theta: d_state/2 (data-dependent RoPE angles)
+    // d_in_proj = 2*d_inner + 2*d_state + 2*nheads + d_state/2
+    float* in_proj;    // (layer, d_in_proj, dim)
+    // SSM parameters (A pre-converted: A = -exp(A_log), so always negative)
+    float* A;          // (layer, nheads)
+    float* D;          // (layer, nheads)  skip connection
+    float* dt_bias;    // (layer, nheads)
+    // QK-Normalization weights for B and C (Section 3.4)
+    float* B_norm;     // (layer, d_state)
+    float* C_norm;     // (layer, d_state)
+    // BC bias: head-specific, channel-wise, initialized to ones (Appendix G)
+    float* B_bias;     // (layer, nheads, d_state)
+    float* C_bias;     // (layer, nheads, d_state)
+    // output projection
+    float* out_proj;   // (layer, dim, d_inner)
+    // SwiGLU MLP weights (per layer, Llama-style)
+    float* mlp_norm;   // (layer, dim) — pre-norm before MLP
+    float* w_gate;     // (layer, d_mlp_inner, dim)
+    float* w_up;       // (layer, d_mlp_inner, dim)
+    float* w_down;     // (layer, dim, d_mlp_inner)
+    // final norm
+    float* final_norm; // (dim)
+    // LM head (may be weight-tied with token_embedding_table)
+    float* lm_head;    // (rounded_vocab_size, dim)
 } MambaWeights;
 
 typedef struct {
-    // memory reused by all layers
-    float* input;        // (dim)
-    float* hidden_state; // (dim)
-    // Mamba2: projection buffer for (z, xBC, dt)
-    float* zxbcdt;       // (2*d_inner + 2*d_state + nheads)
-    // Mamba2: temp buffers
-    float* xBC;          // (d_inner + 2*d_state) after conv
-    float* x;            // (nheads, headdim) reshaped
-    float* dt;           // (nheads) after softplus
-    float* dA;           // (nheads)
-    float* dBx;          // (nheads, headdim, d_state)
-    float* y;            // (d_inner)
-    float* logits;       // (rounded_vocab_size)
-    // internal state, separate memory for each layer
-    // Mamba2: conv_state includes xBC (d_inner + 2*d_state)
-    float* conv_state;   // (n_layers, d_inner + 2*d_state, d_conv)
-    // Mamba2: ssm_state is multi-head (nheads, headdim, d_state)
-    float* ssm_state;    // (n_layers, nheads, headdim, d_state)
+    // scratch buffers reused across layers
+    float* input;       // (dim)        residual stream
+    float* hidden_state;// (dim)        scratch: normed input or matmul output
+    float* proj;        // (d_in_proj)  in_proj output
+    float* x;           // (d_inner)    SSM input values, reshaped as (nheads, headdim)
+    float* B_heads;     // (nheads, d_state)  B after QK-norm + bias + RoPE
+    float* C_heads;     // (nheads, d_state)  C after QK-norm + bias + RoPE
+    float* dt;          // (nheads)     step sizes after softplus
+    float* Bx;          // (nheads, headdim, d_state)  current B⊗x outer product
+    float* y;           // (d_inner)    SSM output before gating
+    float* mlp_gate;    // (d_mlp_inner)
+    float* mlp_up;      // (d_mlp_inner)
+    float* logits;      // (rounded_vocab_size)
+    // persistent inference state (separate allocation per layer)
+    float* ssm_state;   // (n_layers, nheads, headdim, d_state)
+    float* prev_Bx;     // (n_layers, nheads, headdim, d_state)  β term from previous step
+    float* cum_angle;   // (n_layers, nheads, d_state/2)  cumulative RoPE angles Σ Δ_i*θ_i
 } RunState;
 
 typedef struct {
@@ -87,154 +108,155 @@ typedef struct {
 } Mamba;
 
 void malloc_run_state(RunState* s, Config* p) {
-    // Mamba2: compute derived dimensions
-    int conv_dim = p->d_inner + 2 * p->d_state;
-    int d_in_proj = 2 * p->d_inner + 2 * p->d_state + p->nheads;
+    int d_state_half = p->d_state / 2;
+    int d_in_proj = 2 * p->d_inner + 2 * p->d_state + 2 * p->nheads + d_state_half;
 
-    // memory reused by all layers
-    s->input = malloc(p->dim * sizeof(float));
+    s->input        = malloc(p->dim * sizeof(float));
     s->hidden_state = malloc(p->dim * sizeof(float));
-    s->zxbcdt = malloc(d_in_proj * sizeof(float));
-    s->xBC = malloc(conv_dim * sizeof(float));
-    s->x = malloc(p->d_inner * sizeof(float));
-    s->dt = malloc(p->nheads * sizeof(float));
-    s->dA = malloc(p->nheads * sizeof(float));
-    s->dBx = malloc(p->nheads * p->headdim * p->d_state * sizeof(float));
-    s->y = malloc(p->d_inner * sizeof(float));
-    s->logits = malloc(p->rounded_vocab_size * sizeof(float));
-    // internal state, separate memory for each layer
-    // Mamba2: conv_state is (n_layers, d_inner + 2*d_state, d_conv)
-    s->conv_state = calloc(p->n_layers * conv_dim * p->d_conv, sizeof(float));
-    // Mamba2: ssm_state is (n_layers, nheads, headdim, d_state)
+    s->proj         = malloc(d_in_proj * sizeof(float));
+    s->x            = malloc(p->d_inner * sizeof(float));
+    s->B_heads      = malloc(p->nheads * p->d_state * sizeof(float));
+    s->C_heads      = malloc(p->nheads * p->d_state * sizeof(float));
+    s->dt           = malloc(p->nheads * sizeof(float));
+    s->Bx           = malloc(p->nheads * p->headdim * p->d_state * sizeof(float));
+    s->y            = malloc(p->d_inner * sizeof(float));
+    s->mlp_gate     = malloc(p->d_mlp_inner * sizeof(float));
+    s->mlp_up       = malloc(p->d_mlp_inner * sizeof(float));
+    s->logits       = malloc(p->rounded_vocab_size * sizeof(float));
+
     s->ssm_state = calloc(p->n_layers * p->nheads * p->headdim * p->d_state, sizeof(float));
-    // ensure all mallocs went fine
-    if (!s->input || !s->hidden_state || !s->zxbcdt || !s->xBC || !s->x
-     || !s->dt || !s->dA || !s->dBx || !s->y
-     || !s->logits || !s->conv_state || !s->ssm_state) {
+    s->prev_Bx   = calloc(p->n_layers * p->nheads * p->headdim * p->d_state, sizeof(float));
+    s->cum_angle = calloc(p->n_layers * p->nheads * d_state_half, sizeof(float));
+
+    if (!s->input || !s->hidden_state || !s->proj || !s->x
+     || !s->B_heads || !s->C_heads || !s->dt || !s->Bx || !s->y
+     || !s->mlp_gate || !s->mlp_up || !s->logits
+     || !s->ssm_state || !s->prev_Bx || !s->cum_angle) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
 }
 
 void reset_internal_state(Mamba* mamba) {
-    // reset the internal state of the model
     RunState* s = &mamba->state;
     Config* p = &mamba->config;
-    int conv_dim = p->d_inner + 2 * p->d_state;
-    memset(s->conv_state, 0, p->n_layers * conv_dim * p->d_conv * sizeof(float));
+    int d_state_half = p->d_state / 2;
     memset(s->ssm_state, 0, p->n_layers * p->nheads * p->headdim * p->d_state * sizeof(float));
+    memset(s->prev_Bx,   0, p->n_layers * p->nheads * p->headdim * p->d_state * sizeof(float));
+    memset(s->cum_angle, 0, p->n_layers * p->nheads * d_state_half * sizeof(float));
 }
 
 char* get_internal_state(Mamba* mamba, int* state_size) {
-    // get the internal state of the model
     Config* p = &mamba->config;
     RunState* s = &mamba->state;
-    int conv_dim = p->d_inner + 2 * p->d_state;
-    unsigned int conv_state_size = p->n_layers * conv_dim * p->d_conv * sizeof(float);
-    unsigned int ssm_state_size = p->n_layers * p->nheads * p->headdim * p->d_state * sizeof(float);
-    unsigned int total_size = conv_state_size + ssm_state_size;
-    char* state = malloc(total_size);
+    int d_state_half = p->d_state / 2;
+    unsigned int ssm_size = p->n_layers * p->nheads * p->headdim * p->d_state * sizeof(float);
+    unsigned int pbx_size = p->n_layers * p->nheads * p->headdim * p->d_state * sizeof(float);
+    unsigned int ang_size = p->n_layers * p->nheads * d_state_half * sizeof(float);
+    unsigned int total = ssm_size + pbx_size + ang_size;
+    char* state = malloc(total);
     if (state) {
-        memcpy(state, s->conv_state, conv_state_size);
-        memcpy(state + conv_state_size, s->ssm_state, ssm_state_size);
-        *state_size = total_size;
+        memcpy(state,                       s->ssm_state, ssm_size);
+        memcpy(state + ssm_size,            s->prev_Bx,   pbx_size);
+        memcpy(state + ssm_size + pbx_size, s->cum_angle, ang_size);
+        *state_size = total;
     }
     return state;
 }
 
 void set_internal_state(Mamba* mamba, char* state, int state_size) {
-    // set the internal state of the model
     Config* p = &mamba->config;
     RunState* s = &mamba->state;
-    int conv_dim = p->d_inner + 2 * p->d_state;
-    unsigned int conv_state_size = p->n_layers * conv_dim * p->d_conv * sizeof(float);
-    unsigned int ssm_state_size = p->n_layers * p->nheads * p->headdim * p->d_state * sizeof(float);
-    if (state_size == conv_state_size + ssm_state_size) {
-        memcpy(s->conv_state, state, conv_state_size);
-        memcpy(s->ssm_state, state + conv_state_size, ssm_state_size);
+    int d_state_half = p->d_state / 2;
+    unsigned int ssm_size = p->n_layers * p->nheads * p->headdim * p->d_state * sizeof(float);
+    unsigned int pbx_size = p->n_layers * p->nheads * p->headdim * p->d_state * sizeof(float);
+    unsigned int ang_size = p->n_layers * p->nheads * d_state_half * sizeof(float);
+    if ((unsigned int)state_size == ssm_size + pbx_size + ang_size) {
+        memcpy(s->ssm_state, state,                       ssm_size);
+        memcpy(s->prev_Bx,   state + ssm_size,            pbx_size);
+        memcpy(s->cum_angle, state + ssm_size + pbx_size, ang_size);
     }
 }
 
 void free_run_state(RunState* s) {
     free(s->input);
     free(s->hidden_state);
-    free(s->zxbcdt);
-    free(s->xBC);
+    free(s->proj);
     free(s->x);
+    free(s->B_heads);
+    free(s->C_heads);
     free(s->dt);
-    free(s->dA);
-    free(s->dBx);
+    free(s->Bx);
     free(s->y);
+    free(s->mlp_gate);
+    free(s->mlp_up);
     free(s->logits);
-    free(s->conv_state);
     free(s->ssm_state);
+    free(s->prev_Bx);
+    free(s->cum_angle);
 }
 
-void memory_map_weights(MambaWeights *w, Config* p, float* ptr) {
-    // the multiplications below are done in 64-bit to fit the parameter counts of 13B+ models
+void memory_map_weights(MambaWeights* w, Config* p, float* ptr) {
     unsigned long long n_layers = p->n_layers;
-    int conv_dim = p->d_inner + 2 * p->d_state;
-    int d_in_proj = 2 * p->d_inner + 2 * p->d_state + p->nheads;
+    int d_state_half = p->d_state / 2;
+    int d_in_proj = 2 * p->d_inner + 2 * p->d_state + 2 * p->nheads + d_state_half;
 
-    // get the pointers to the weights
-    w->token_embedding_table = ptr;  ptr += p->rounded_vocab_size * p->dim;
-    // Mamba2: in_proj projects to (z, xBC, dt) combined
-    w->in_proj = ptr;                ptr += n_layers * d_in_proj * p->dim;
-    // Mamba2: conv1d applies to xBC (d_inner + 2*d_state)
-    w->conv1d_weight = ptr;          ptr += n_layers * conv_dim * p->d_conv;
-    w->conv1d_bias = ptr;            ptr += n_layers * conv_dim;
-    // Mamba2: dt_bias is per-head
-    w->dt_bias = ptr;                ptr += n_layers * p->nheads;
-    // Mamba2: A is per-head (pre-converted: A = -exp(A_log))
-    w->A = ptr;                      ptr += n_layers * p->nheads;
-    // Mamba2: D is per-head
-    w->D = ptr;                      ptr += n_layers * p->nheads;
-    // Mamba2: inner norm weight for gated RMSNorm
-    w->inner_norm = ptr;             ptr += n_layers * p->d_inner;
-    w->out_proj = ptr;               ptr += n_layers * p->dim * p->d_inner;
-    w->norm = ptr;                   ptr += n_layers * p->dim;
-    w->final_norm = ptr;             ptr += p->dim;
-    // the classifier weights can be shared with the token embedding table
+    w->token_embedding_table = ptr; ptr += p->rounded_vocab_size * p->dim;
+    w->mixer_norm  = ptr;           ptr += n_layers * p->dim;
+    w->in_proj     = ptr;           ptr += n_layers * d_in_proj * p->dim;
+    w->A           = ptr;           ptr += n_layers * p->nheads;
+    w->D           = ptr;           ptr += n_layers * p->nheads;
+    w->dt_bias     = ptr;           ptr += n_layers * p->nheads;
+    w->B_norm      = ptr;           ptr += n_layers * p->d_state;
+    w->C_norm      = ptr;           ptr += n_layers * p->d_state;
+    w->B_bias      = ptr;           ptr += n_layers * p->nheads * p->d_state;
+    w->C_bias      = ptr;           ptr += n_layers * p->nheads * p->d_state;
+    w->out_proj    = ptr;           ptr += n_layers * p->dim * p->d_inner;
+    w->mlp_norm    = ptr;           ptr += n_layers * p->dim;
+    w->w_gate      = ptr;           ptr += n_layers * p->d_mlp_inner * p->dim;
+    w->w_up        = ptr;           ptr += n_layers * p->d_mlp_inner * p->dim;
+    w->w_down      = ptr;           ptr += n_layers * p->dim * p->d_mlp_inner;
+    w->final_norm  = ptr;           ptr += p->dim;
     w->lm_head = p->shared_classifier ? w->token_embedding_table : ptr;
 }
 
 void load_model_file(char* model_path, Config* config, MambaWeights* weights,
                      int* fd, float** data, ssize_t* file_size) {
-    FILE *file = fopen(model_path, "rb");
+    FILE* file = fopen(model_path, "rb");
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", model_path); exit(EXIT_FAILURE); }
-    // read the magic number
+    // magic number 'Mmb3' = 0x4d6d6233
     unsigned int magic;
     if (fread(&magic, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    // Mamba2 uses magic 'Mmb2' = 0x4d6d6232
-    if (magic != 0x4d6d6232) { fprintf(stderr, "Invalid magic number: %x (expected Mamba2: 0x4d6d6232)\n", magic); exit(EXIT_FAILURE); }
-    // read the version
+    if (magic != 0x4d6d6233) {
+        fprintf(stderr, "Invalid magic: %x (expected Mamba3: 0x4d6d6233)\n", magic);
+        exit(EXIT_FAILURE);
+    }
     int version;
     if (fread(&version, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (version != 2) { fprintf(stderr, "Invalid version: %d (expected 2 for Mamba2)\n", version); exit(EXIT_FAILURE); }
-    // read the config fields individually (n_layers, vocab_size, dim, d_inner, d_state, d_conv, headdim, shared_classifier)
-    if (fread(&config->n_layers, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->vocab_size, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->dim, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->d_inner, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->d_state, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->d_conv, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->headdim, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->shared_classifier, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    // compute derived values
+    if (version != 3) {
+        fprintf(stderr, "Invalid version: %d (expected 3 for Mamba3)\n", version);
+        exit(EXIT_FAILURE);
+    }
+    // config: n_layers, vocab_size, dim, d_inner, d_state, headdim, d_mlp_inner, shared_classifier
+    if (fread(&config->n_layers,         sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->vocab_size,       sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->dim,              sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->d_inner,          sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->d_state,          sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->headdim,          sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->d_mlp_inner,      sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->shared_classifier,sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    // derived values
     config->nheads = config->d_inner / config->headdim;
-    // Mamba2 pads vocab to multiple of 16
-    int pad_multiple = 16;
-    if (config->vocab_size % pad_multiple != 0) {
-        config->rounded_vocab_size = config->vocab_size + (pad_multiple - (config->vocab_size % pad_multiple));
+    if (config->vocab_size % 16 != 0) {
+        config->rounded_vocab_size = config->vocab_size + (16 - config->vocab_size % 16);
     } else {
         config->rounded_vocab_size = config->vocab_size;
     }
-    // figure out the file size
-    fseek(file, 0, SEEK_END); // move file pointer to end of file
-    *file_size = ftell(file); // get the file size, in bytes
+    fseek(file, 0, SEEK_END);
+    *file_size = ftell(file);
     fclose(file);
-    // memory map the model weights into the data pointer
-    *fd = open(model_path, O_RDONLY); // open in read only mode
+    *fd = open(model_path, O_RDONLY);
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
     *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
@@ -287,25 +309,6 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     }
 }
 
-void gated_rmsnorm(float* o, float* x, float* z, float* weight, int size) {
-    // Mamba2: Gated RMSNorm - first multiply x by silu(z), then apply RMSNorm
-    // x = x * silu(z)
-    // then normalize: x * rsqrt(mean(x^2) + eps) * weight
-    float ss = 0.0f;
-    for (int j = 0; j < size; j++) {
-        float xz = x[j] * silu(z[j]);
-        o[j] = xz;  // temporarily store x * silu(z)
-        ss += xz * xz;
-    }
-    ss /= size;
-    ss += 1e-5f;
-    ss = 1.0f / sqrtf(ss);
-    // normalize and scale
-    for (int j = 0; j < size; j++) {
-        o[j] = o[j] * weight[j] * ss;
-    }
-}
-
 void softmax(float* x, int size) {
     // find max value (for numerical stability)
     float max_val = x[0];
@@ -326,36 +329,6 @@ void softmax(float* x, int size) {
     }
 }
 
-void shift_matrix_left(float* matrix, int rows, int cols) {
-    #pragma omp parallel for
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < cols - 1; j++) {
-            matrix[i * cols + j] = matrix[i * cols + j + 1];
-        }
-    }
-}
-
-void update_last_column(float* matrix, float* x, int rows, int cols) {
-    #pragma omp parallel for
-    for (int i = 0; i < rows; i++) {
-        matrix[i * cols + cols - 1] = x[i];
-    }
-}
-
-void rowwise_dot_product(float* out, float* matrix, float* weights, int rows, int cols) {
-    // matrix[rows,cols], weights[cols] -> out[rows]
-    // this is a dot product of each row of the matrix with the weights
-    // i.e. out[i] = matrix[i,:] @ weights
-    #pragma omp parallel for
-    for (int i = 0; i < rows; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < cols; j++) {
-            val += matrix[i * cols + j] * weights[j];
-        }
-        out[i] = val;
-    }
-}
-
 void matmul(float* xout, float* x, float* w, int d, int n) {
     // w[d,n] @ x[n] -> xout[d]
     #pragma omp parallel for
@@ -368,204 +341,179 @@ void matmul(float* xout, float* x, float* w, int d, int n) {
     }
 }
 
-void linear(float* xout, float* x, float* w, float* b, int d, int n) {
-    // w[d,n] @ x[n] + b[d] -> xout[d]
+// Apply data-dependent RoPE to x in-place.
+// x:      (nheads, d_state) — B or C projection to rotate
+// angles: (nheads, d_state/2) — cumulative rotation angles (already negated)
+// Rotates each (x[2j], x[2j+1]) pair by angles[j] per head.
+void apply_rope(float* x, float* angles, int nheads, int d_state) {
+    int half = d_state / 2;
     #pragma omp parallel for
-    for (int i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val + b[i];
-    }
-}
-
-void broadcast_multiply(float* out, float* x, float* y, int d, int n) {
-    // x[d], y[d,n] -> out[d,n]
-    #pragma omp parallel for
-    for (int i = 0; i < d; i++) {
-        for (int j = 0; j < n; j++) {
-            int index = i * n + j;
-            out[index] = x[i] * y[index];
-            //out[i * n + j] = x[i] * y[i * n + j];
+    for (int h = 0; h < nheads; h++) {
+        float* xh = x + h * d_state;
+        float* ah = angles + h * half;
+        for (int j = 0; j < half; j++) {
+            float x1 = xh[2 * j];
+            float x2 = xh[2 * j + 1];
+            float c = cosf(ah[j]);
+            float s = sinf(ah[j]);
+            xh[2 * j]     = c * x1 - s * x2;
+            xh[2 * j + 1] = s * x1 + c * x2;
         }
     }
 }
 
-void elementwise_multiply(float* result, float* matrix1, float* matrix2, int total_elements) {
-    #pragma omp parallel for
-    for (int i = 0; i < total_elements; i++) {
-        result[i] = matrix1[i] * matrix2[i];
-    }
-}
-
-void elementwise_add(float* result, float* matrix1, float* matrix2, int total_elements) {
-    #pragma omp parallel for
-    for (int i = 0; i < total_elements; i++) {
-        result[i] = matrix1[i] + matrix2[i];
-    }
-}
-
-void elementwise_multiply_and_add(float* result, float* matrix1, float* matrix2, float* matrix3, int total_elements) {
-    #pragma omp parallel for
-    for (int i = 0; i < total_elements; i++) {
-        result[i] = matrix1[i] * matrix2[i] + matrix3[i];
-    }
-}
-
-void outer_product(float* out, float* x, float* y, int d, int n) {
-    // x[d], y[n] -> out[d,n]
-    #pragma omp parallel for
-    for (int i = 0; i < d; i++) {
-        for (int j = 0; j < n; j++) {
-            out[i * n + j] = x[i] * y[j];
-        }
-    }
-}
-
-void sum_along_last_dim(float* result, float* matrix, int rows, int cols) {
-    #pragma omp parallel for
-    for (int i = 0; i < rows; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < cols; j++) {
-            val += matrix[i * cols + j];
-        }
-        result[i] = val;
-    }
-}
-
-void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
+// Forward one Mamba-3 layer: SSM mixer (with trapezoidal recurrence + RoPE) + SwiGLU MLP.
+// input is modified in-place (residual stream).
+void forward_layer(Mamba* mamba, unsigned long long l, float* input) {
     Config* p = &mamba->config;
     MambaWeights* w = &mamba->weights;
     RunState* s = &mamba->state;
-    int dim = p->dim, d_inner = p->d_inner, d_conv = p->d_conv, d_state = p->d_state;
+    int dim = p->dim, d_inner = p->d_inner, d_state = p->d_state;
     int headdim = p->headdim, nheads = p->nheads;
-    int conv_dim = d_inner + 2 * d_state;
-    int d_in_proj = 2 * d_inner + 2 * d_state + nheads;
-    float* dA  = s->dA;   // (nheads)
-    float* dBx = s->dBx;  // (nheads, headdim, d_state)
-    float* y   = s->y;    // (d_inner)
+    int d_state_half = d_state / 2;
+    int d_in_proj = 2 * d_inner + 2 * d_state + 2 * nheads + d_state_half;
 
-    // Get pointers to this layer's states
-    // conv_state: (conv_dim, d_conv) = (d_inner + 2*d_state, d_conv)
-    float* conv_state = s->conv_state + l * conv_dim * d_conv;
-    // ssm_state: (nheads, headdim, d_state)
-    float* ssm_state  = s->ssm_state  + l * nheads * headdim * d_state;
+    // Persistent per-layer state
+    float* ssm_state = s->ssm_state + l * nheads * headdim * d_state;
+    float* prev_Bx   = s->prev_Bx   + l * nheads * headdim * d_state;
+    float* cum_angle = s->cum_angle + l * nheads * d_state_half;
 
-    // Get pointers to this layer's weights
-    float* in_proj       = w->in_proj       + l * d_in_proj * dim;
-    float* conv1d_weight = w->conv1d_weight + l * conv_dim * d_conv;
-    float* conv1d_bias   = w->conv1d_bias   + l * conv_dim;
-    float* dt_bias       = w->dt_bias       + l * nheads;
-    float* A             = w->A             + l * nheads;
-    float* D             = w->D             + l * nheads;
-    float* inner_norm    = w->inner_norm    + l * d_inner;
-    float* out_proj      = w->out_proj      + l * dim * d_inner;
+    // Layer weight pointers
+    float* mixer_norm_w = w->mixer_norm + l * dim;
+    float* in_proj_w    = w->in_proj    + l * d_in_proj * dim;
+    float* A_w          = w->A          + l * nheads;
+    float* D_w          = w->D          + l * nheads;
+    float* dt_bias_w    = w->dt_bias    + l * nheads;
+    float* B_norm_w     = w->B_norm     + l * d_state;
+    float* C_norm_w     = w->C_norm     + l * d_state;
+    float* B_bias_w     = w->B_bias     + l * nheads * d_state;
+    float* C_bias_w     = w->C_bias     + l * nheads * d_state;
+    float* out_proj_w   = w->out_proj   + l * dim * d_inner;
+    float* mlp_norm_w   = w->mlp_norm   + l * dim;
+    float* w_gate_w     = w->w_gate     + l * p->d_mlp_inner * dim;
+    float* w_up_w       = w->w_up       + l * p->d_mlp_inner * dim;
+    float* w_down_w     = w->w_down     + l * dim * p->d_mlp_inner;
 
-    // ========== Input Projection ==========
-    // zxbcdt = self.in_proj(hidden_states)  # (d_in_proj)
-    // Mamba2: in_proj projects to (z, xBC, dt) combined
-    matmul(s->zxbcdt, hidden_state, in_proj, d_in_proj, dim);
+    // ====================================================================
+    // SSM Mixer
+    // ====================================================================
 
-    // Split: z (d_inner), xBC (d_inner + 2*d_state), dt (nheads)
-    float* z = s->zxbcdt;                          // z (d_inner)
-    float* xBC_proj = s->zxbcdt + d_inner;         // xBC (d_inner + 2*d_state)
-    float* dt_raw = s->zxbcdt + d_inner + conv_dim; // dt (nheads)
+    // Pre-normalization (Llama-style)
+    rmsnorm(s->hidden_state, input, mixer_norm_w, dim);
 
-    // ========== Convolution Step ==========
-    // Advance convolution input: conv_state = roll(conv_state, shifts=-1, dims=-1)
-    shift_matrix_left(conv_state, conv_dim, d_conv);
-    // conv_state[:, -1] = xBC
-    update_last_column(conv_state, xBC_proj, conv_dim, d_conv);
+    // Input projection → (z, x, B, C, dt, lam, theta)
+    matmul(s->proj, s->hidden_state, in_proj_w, d_in_proj, dim);
 
-    // xBC = sum(conv_state * conv1d.weight, dim=-1)
-    // conv_state: (conv_dim, d_conv), conv1d_weight: (conv_dim, d_conv)
-    float* xBC = s->xBC;
-    #pragma omp parallel for
-    for (int i = 0; i < conv_dim; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < d_conv; j++) {
-            int idx = i * d_conv + j;
-            val += conv_state[idx] * conv1d_weight[idx];
-        }
-        xBC[i] = val;
-    }
-    // xBC = xBC + conv1d.bias
-    for (int i = 0; i < conv_dim; i++) {
-        xBC[i] += conv1d_bias[i];
-    }
-    // xBC = silu(xBC)
-    for (int i = 0; i < conv_dim; i++) {
-        xBC[i] = silu(xBC[i]);
-    }
+    // Split projection buffer
+    float* z     = s->proj;
+    float* x_raw = s->proj + d_inner;
+    float* B_raw = s->proj + 2 * d_inner;
+    float* C_raw = s->proj + 2 * d_inner + d_state;
+    float* dt_raw= s->proj + 2 * d_inner + 2 * d_state;
+    float* lam   = s->proj + 2 * d_inner + 2 * d_state + nheads;
+    float* theta = s->proj + 2 * d_inner + 2 * d_state + 2 * nheads;
 
-    // Split xBC into x (d_inner), B (d_state), C (d_state)
-    float* x = s->x;                    // will hold reshaped x (nheads, headdim)
-    float* B = xBC + d_inner;           // B (d_state)
-    float* C = xBC + d_inner + d_state; // C (d_state)
+    // Copy x into scratch buffer (nheads, headdim)
+    memcpy(s->x, x_raw, d_inner * sizeof(float));
 
-    // Copy x portion (d_inner elements)
-    for (int i = 0; i < d_inner; i++) {
-        x[i] = xBC[i];
-    }
-
-    // ========== SSM Step ==========
-    // A is pre-converted: A = -exp(A_log)
-    // dt = softplus(dt + dt_bias)  # (nheads)
-    // dA = exp(dt * A)  # (nheads)
+    // Discretization: dt = softplus(dt + dt_bias), lam = sigmoid(lam)
     float* dt = s->dt;
     for (int h = 0; h < nheads; h++) {
-        dt[h] = softplus(dt_raw[h] + dt_bias[h]);
-        dA[h] = expf(dt[h] * A[h]);
+        dt[h]  = softplus(dt_raw[h] + dt_bias_w[h]);
+        lam[h] = sigmoid(lam[h]);
     }
 
-    // Compute dBx = einsum("h, n, hp -> hpn", dt, B, x)
-    // dBx[h,p,n] = dt[h] * B[n] * x[h,p]
+    // QK-Normalization on B and C (Section 3.4)
+    rmsnorm(B_raw, B_raw, B_norm_w, d_state);
+    rmsnorm(C_raw, C_raw, C_norm_w, d_state);
+
+    // Update cumulative RoPE angles: cum_angle[h,j] -= dt[h] * theta[j]
+    // (negative because we accumulate −Σ Δ_i*θ_i)
     #pragma omp parallel for
     for (int h = 0; h < nheads; h++) {
-        float dt_h = dt[h];
-        for (int p = 0; p < headdim; p++) {
-            float dt_x = dt_h * x[h * headdim + p];
+        for (int j = 0; j < d_state_half; j++) {
+            cum_angle[h * d_state_half + j] -= dt[h] * theta[j];
+        }
+    }
+
+    // Broadcast B and C to all heads, add head-specific bias, then apply RoPE.
+    // QK-norm → add bias → RoPE.
+    #pragma omp parallel for
+    for (int h = 0; h < nheads; h++) {
+        for (int n = 0; n < d_state; n++) {
+            s->B_heads[h * d_state + n] = B_raw[n] + B_bias_w[h * d_state + n];
+            s->C_heads[h * d_state + n] = C_raw[n] + C_bias_w[h * d_state + n];
+        }
+    }
+    apply_rope(s->B_heads, cum_angle, nheads, d_state);
+    apply_rope(s->C_heads, cum_angle, nheads, d_state);
+
+    // Trapezoidal state update + output computation (Proposition 1, Eq. 4):
+    //   α   = exp(Δ * A)              — decay (A is already negative: A = -exp(A_log))
+    //   β   = (1 − λ) * Δ * α        — left-endpoint coefficient (previous input)
+    //   γ   = λ * Δ                  — right-endpoint coefficient (current input)
+    //   Bx  = outer(B̄_t, x_t)        — current contribution
+    //   h_t = α * h_{t-1} + β * Bx_{t-1} + γ * Bx_t
+    //   y_t = h_t^T C̄_t + D * x_t
+    #pragma omp parallel for
+    for (int h = 0; h < nheads; h++) {
+        float alpha     = expf(dt[h] * A_w[h]);
+        float beta      = (1.0f - lam[h]) * dt[h] * alpha;
+        float gamma_val = lam[h] * dt[h];
+        float D_h       = D_w[h];
+
+        for (int pp = 0; pp < headdim; pp++) {
+            float xhp = s->x[h * headdim + pp];
+            float y_hp = 0.0f;
+
             for (int n = 0; n < d_state; n++) {
-                dBx[h * headdim * d_state + p * d_state + n] = dt_x * B[n];
+                int idx = h * headdim * d_state + pp * d_state + n;
+                float bx = s->B_heads[h * d_state + n] * xhp;
+                s->Bx[idx] = bx;
+                ssm_state[idx] = alpha    * ssm_state[idx]
+                               + beta     * prev_Bx[idx]
+                               + gamma_val * bx;
+                y_hp += ssm_state[idx] * s->C_heads[h * d_state + n];
             }
+            s->y[h * headdim + pp] = y_hp + D_h * xhp;
         }
     }
 
-    //  Update ssm_state
-    // ssm_state = ssm_state * dA + dBx
-    // dA[h] broadcasts over (headdim, d_state) dimensions
-    // Note: Can't use elementwise_multiply_and_add directly (dA needs per-head broadcast)
+    // Gate: y = y ⊙ silu(z)
     #pragma omp parallel for
-    for (int h = 0; h < nheads; h++) {
-        float dA_h = dA[h];
-        int h_offset = h * headdim * d_state;
-        for (int i = 0; i < headdim * d_state; i++) {
-            int idx = h_offset + i;
-            ssm_state[idx] = ssm_state[idx] * dA_h + dBx[idx];
-        }
+    for (int i = 0; i < d_inner; i++) {
+        s->y[i] *= silu(z[i]);
     }
 
-    //  Compute y
-    // y = torch.einsum("dn,n->d", ssm_state, C) # ssm_state (d_inner, d_state), C (d_state), y (d_inner)
-    rowwise_dot_product(y, ssm_state, C, d_inner, d_state);
+    // Output projection and residual connection
+    matmul(s->hidden_state, s->y, out_proj_w, dim, d_inner);
+    #pragma omp parallel for
+    for (int i = 0; i < dim; i++) { input[i] += s->hidden_state[i]; }
 
-    // y = y + D * x  where D is (nheads) and x is (nheads, headdim)
-    // D is broadcast across headdim
-    for (int h = 0; h < nheads; h++) {
-        float D_h = D[h];
-        for (int p = 0; p < headdim; p++) {
-            y[h * headdim + p] += D_h * x[h * headdim + p];
-        }
+    // Save Bx → prev_Bx for next token's β term
+    memcpy(prev_Bx, s->Bx, nheads * headdim * d_state * sizeof(float));
+
+    // ====================================================================
+    // SwiGLU MLP  (Llama-style: SwiGLU(x) = W_down(silu(W_gate(x)) ⊙ W_up(x)))
+    // ====================================================================
+
+    // Pre-normalization
+    rmsnorm(s->hidden_state, input, mlp_norm_w, dim);
+
+    // Gate and Up projections
+    matmul(s->mlp_gate, s->hidden_state, w_gate_w, p->d_mlp_inner, dim);
+    matmul(s->mlp_up,   s->hidden_state, w_up_w,   p->d_mlp_inner, dim);
+
+    // Fused SwiGLU: gate = silu(gate) * up  (in-place into mlp_gate)
+    #pragma omp parallel for
+    for (int i = 0; i < p->d_mlp_inner; i++) {
+        s->mlp_gate[i] = silu(s->mlp_gate[i]) * s->mlp_up[i];
     }
 
-    // ========== Gated RMSNorm ==========
-    // y = norm(y, z) = (y * silu(z)) * rsqrt(mean + eps) * weight
-    gated_rmsnorm(y, y, z, inner_norm, d_inner);
-
-    // ========== Output Projection ==========
-    // hidden_state = self.out_proj(y)  # out_proj (dim, d_inner), hidden_state (dim)
-    matmul(hidden_state, y, out_proj, dim, d_inner);
+    // Down projection and residual connection
+    matmul(s->hidden_state, s->mlp_gate, w_down_w, dim, p->d_mlp_inner);
+    #pragma omp parallel for
+    for (int i = 0; i < dim; i++) { input[i] += s->hidden_state[i]; }
 }
 
 float* forward(Mamba* mamba, int token) {
@@ -573,33 +521,20 @@ float* forward(Mamba* mamba, int token) {
     Config* p = &mamba->config;
     MambaWeights* w = &mamba->weights;
     RunState* s = &mamba->state;
-    int dim = p->dim;
-    float *input = s->input;
-    float *hidden_state = s->hidden_state;
+    float* input = s->input;
 
     // copy the token embedding into x
-    float* content_row = w->token_embedding_table + token * dim;
-    memcpy(input, content_row, dim * sizeof(float));
+    memcpy(input, w->token_embedding_table + token * p->dim, p->dim * sizeof(float));
 
     // forward all the layers
-    for(unsigned long long l = 0; l < p->n_layers; l++) {
-        // normalize the input
-        rmsnorm(hidden_state, input, w->norm + l * dim, dim);
-        // forward this layer
-        forward_layer(mamba, l, hidden_state);
-        // residual connection back into hidden_state
-        for (int i = 0; i < dim; i++) {
-            hidden_state[i] += input[i];
-            // copy hidden_state back into input for the next layer
-            input[i] = hidden_state[i];
-        }
+    for (unsigned long long l = 0; l < p->n_layers; l++) {
+        forward_layer(mamba, l, input);
     }
 
     // final rmsnorm
-    rmsnorm(hidden_state, hidden_state, w->final_norm, dim);
-
+    rmsnorm(s->hidden_state, input, w->final_norm, p->dim);
     // classifier into logits
-    matmul(s->logits, hidden_state, w->lm_head, p->rounded_vocab_size, p->dim);
+    matmul(s->logits, s->hidden_state, w->lm_head, p->rounded_vocab_size, p->dim);
     return s->logits;
 }
 
@@ -1055,9 +990,6 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 
 // ----------------------------------------------------------------------------
 // chat loop
-// I manually inspected the tokens for a few chat conversations compared to
-// python reference and that seemed ok, but this was not thoroughly tested and
-// is not safely implemented, it's more a proof of concept atm.
 
 void chat(Mamba *mamba, Tokenizer *tokenizer, Sampler *sampler,
           char *cli_user_prompt, char *cli_system_prompt, int steps) {
@@ -1206,9 +1138,12 @@ int main(int argc, char *argv[]) {
     load_model(&mamba, model_path);
 
     // print the config
-    fprintf(stderr, "config: vocab_size=%d (%d), n_layers=%d, dim=%d, d_inner=%d, d_state=%d, d_conv=%d, headdim=%d, nheads=%d\n",
-            mamba.config.vocab_size, mamba.config.rounded_vocab_size, mamba.config.n_layers, mamba.config.dim,
-            mamba.config.d_inner, mamba.config.d_state, mamba.config.d_conv, mamba.config.headdim, mamba.config.nheads);
+    fprintf(stderr, "Mamba-3: vocab=%d (%d), layers=%d, dim=%d, d_inner=%d, "
+            "d_state=%d, headdim=%d, nheads=%d, d_mlp_inner=%d\n",
+            mamba.config.vocab_size, mamba.config.rounded_vocab_size,
+            mamba.config.n_layers, mamba.config.dim, mamba.config.d_inner,
+            mamba.config.d_state, mamba.config.headdim, mamba.config.nheads,
+            mamba.config.d_mlp_inner);
 
     if (steps == 0) steps = 256; // override to default len if 0
 

@@ -23,28 +23,37 @@ def write_weights(file, model, key):
     print(f"writing {key} {list(model[key].shape)[::-1]}")
     serialize_fp32(file, model[key])
 
-def write_layer_weights(file, model, layer, n_layers):
+def write_layer_weights(file, model, key_pattern, n_layers):
     """ writes the layer weights to file """
-    print(f"writing {layer % n_layers} {list(model[layer % 0].shape)[::-1]}")
     for n in range(n_layers):
-        serialize_fp32(file, model[layer % n])
+        key = key_pattern % n
+        print(f"writing {key} {list(model[key].shape)[::-1]}")
+        serialize_fp32(file, model[key])
 
 def model_export(model, config, filepath):
     """
-    Export the Mamba2 model weights in full float32 .bin file to be read from C.
+    Export the Mamba3 model weights in full float32 .bin file to be read from C.
+
+    File layout (header is padded to 256 bytes):
+        magic:   uint32  'Mmb3' = 0x4d6d6233
+        version: int32   3
+        config:  8 x int32  (n_layers, vocab_size, dim, d_inner, d_state,
+                              headdim, d_mlp_inner, shared_classifier)
+        <256-byte header>
+        weights: (see memory_map_weights in mamba.c for the exact order)
     """
-    version = 2
+    version = 3
 
     out_file = open(filepath, 'wb')
 
     # first write the header (256 bytes)
 
-    # write magic, uint32 of "Mmb2" (Mamba2)
-    out_file.write(struct.pack('I', 0x4d6d6232))
+    # write magic, uint32 of "Mmb3" (Mamba3)
+    out_file.write(struct.pack('I', 0x4d6d6233))
     # write version
     out_file.write(struct.pack('i', version))
 
-    # Mamba2 config extraction - infer from model weights if not in config
+    # Mamba3 config extraction - infer from model weights if not in config
     d_model = config.d_model
     n_layers = config.n_layer
     vocab_size = config.vocab_size
@@ -52,17 +61,14 @@ def model_export(model, config, filepath):
     # Infer parameters from model weights
     # nheads from A_log shape
     nheads = model['backbone.layers.0.mixer.A_log'].shape[0]
-    # d_inner from out_proj or norm.weight
-    d_inner = model['backbone.layers.0.mixer.norm.weight'].shape[0]
+    # d_inner from out_proj.weight
+    d_inner = model['backbone.layers.0.mixer.out_proj.weight'].shape[1]
     # headdim = d_inner / nheads
     headdim = d_inner // nheads
-    # conv_dim from conv1d.weight, d_state = (conv_dim - d_inner) / 2
-    conv_dim = model['backbone.layers.0.mixer.conv1d.weight'].shape[0]
-    d_state = (conv_dim - d_inner) // 2
-    # d_conv from conv1d.weight
-    d_conv = model['backbone.layers.0.mixer.conv1d.weight'].shape[2]
-
-    d_in_proj = 2 * d_inner + 2 * d_state + nheads
+    # d_state from B_bias
+    d_state = model['backbone.layers.0.mixer.B_bias'].shape[-1]
+    # d_mlp_inner from mlp.w_gate.weight
+    d_mlp_inner = model['backbone.layers.0.mlp.w_gate.weight'].shape[0]
 
     shared_classifier = torch.equal(model['backbone.embedding.weight'], model['lm_head.weight'])
 
@@ -72,15 +78,15 @@ def model_export(model, config, filepath):
     print(f"  d_model (dim): {d_model}")
     print(f"  d_inner: {d_inner}")
     print(f"  d_state: {d_state}")
-    print(f"  d_conv: {d_conv}")
     print(f"  headdim: {headdim}")
     print(f"  nheads: {nheads}")
+    print(f"  d_mlp_inner: {d_mlp_inner}")
     print(f"  shared classifier: {shared_classifier}")
 
-    # write the params: n_layers, vocab_size, dim, d_inner, d_state, d_conv, headdim, shared_classifier
+    # write the params: n_layers, vocab_size, dim, d_inner, d_state, headdim, d_mlp_inner, shared_classifier
     # Note: nheads is computed (d_inner / headdim), rounded_vocab_size is computed
     header = struct.pack('iiiiiiii', n_layers, vocab_size, d_model,
-                         d_inner, d_state, d_conv, headdim, int(shared_classifier))
+                         d_inner, d_state, headdim, d_mlp_inner, int(shared_classifier))
     out_file.write(header)
 
     # pad the rest with zeros
@@ -89,17 +95,22 @@ def model_export(model, config, filepath):
     out_file.write(b'\0' * pad)
 
     '''
-    Mamba2 model structure example:
+    Mamba3 model structure example:
     backbone.embedding.weight - [vocab_size, d_model]
+    backbone.layers.0.mixer.mixer_norm.weight - [d_model]
     backbone.layers.0.mixer.in_proj.weight - [d_in_proj, d_model]
-    backbone.layers.0.mixer.conv1d.weight - [conv_dim, 1, d_conv]
-    backbone.layers.0.mixer.conv1d.bias - [conv_dim]
-    backbone.layers.0.mixer.dt_bias - [nheads]
     backbone.layers.0.mixer.A_log - [nheads]
     backbone.layers.0.mixer.D - [nheads]
-    backbone.layers.0.mixer.norm.weight - [d_inner]
+    backbone.layers.0.mixer.dt_bias - [nheads]
+    backbone.layers.0.mixer.B_norm.weight - [d_state]
+    backbone.layers.0.mixer.C_norm.weight - [d_state]
+    backbone.layers.0.mixer.B_bias - [nheads, d_state]
+    backbone.layers.0.mixer.C_bias - [nheads, d_state]
     backbone.layers.0.mixer.out_proj.weight - [d_model, d_inner]
-    backbone.layers.0.norm.weight - [d_model]
+    backbone.layers.0.mlp.mlp_norm.weight - [d_model]
+    backbone.layers.0.mlp.w_gate.weight - [d_mlp_inner, d_model]
+    backbone.layers.0.mlp.w_up.weight - [d_mlp_inner, d_model]
+    backbone.layers.0.mlp.w_down.weight - [d_model, d_mlp_inner]
     backbone.norm_f.weight - [d_model]
     lm_head.weight - [vocab_size, d_model]
     '''
@@ -114,22 +125,21 @@ def model_export(model, config, filepath):
     # write the embedding weights
     write_weights(out_file, model, 'backbone.embedding.weight')
 
-    # layer weights
+    # layer weights (order must match memory_map_weights in mamba.c)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.mixer_norm.weight', n_layers)
     write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.in_proj.weight', n_layers)
-
-    # conv1d weight needs reshaping: (conv_dim, 1, d_conv) -> (conv_dim, d_conv)
-    for n in range(n_layers):
-        conv_weight = model[f'backbone.layers.{n}.mixer.conv1d.weight'].squeeze(1)
-        print(f"writing backbone.layers.{n}.mixer.conv1d.weight {list(conv_weight.shape)[::-1]}")
-        serialize_fp32(out_file, conv_weight)
-
-    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.conv1d.bias', n_layers)
-    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.dt_bias', n_layers)
     write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.A', n_layers)
     write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.D', n_layers)
-    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.norm.weight', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.dt_bias', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.B_norm.weight', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.C_norm.weight', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.B_bias', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.C_bias', n_layers)
     write_layer_weights(out_file, model, 'backbone.layers.%d.mixer.out_proj.weight', n_layers)
-    write_layer_weights(out_file, model, 'backbone.layers.%d.norm.weight', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mlp.mlp_norm.weight', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mlp.w_gate.weight', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mlp.w_up.weight', n_layers)
+    write_layer_weights(out_file, model, 'backbone.layers.%d.mlp.w_down.weight', n_layers)
 
     # final norm weights
     write_weights(out_file, model, 'backbone.norm_f.weight')
@@ -179,16 +189,17 @@ def load_model(path):
 def get_model_from_huggingface(model_name: str):
     """Download model from HuggingFace and get the path to the model directory.
     The model name can be one of the following:
-        'state-spaces/mamba2-130m'
-        'state-spaces/mamba2-370m'
-        'state-spaces/mamba2-780m'
-        'state-spaces/mamba2-1.3b'
-        'state-spaces/mamba2-2.7b'
+        'state-spaces/mamba3-130m'
+        'state-spaces/mamba3-370m'
+        'state-spaces/mamba3-780m'
+        'state-spaces/mamba3-1.3b'
+        'state-spaces/mamba3-2.7b'
     """
     from huggingface_hub import snapshot_download
 
     local_dir = snapshot_download(repo_id=model_name)
     return local_dir
+
 
 # -----------------------------------------------------------------------------
 # CLI entrypoint
@@ -196,12 +207,12 @@ def get_model_from_huggingface(model_name: str):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("source", type=str, help="model name or folder where the model files are located", default="state-spaces/mamba2-130m")
+    parser.add_argument("source", type=str, help="model name or folder where the model files are located", default="state-spaces/mamba3-130m")
     parser.add_argument("destination", type=str, help="full path to the output file", default="model.bin")
     args = parser.parse_args()
 
-    # if the source starts with 'state-spaces/mamba2-' then load the model from HuggingFace
-    if args.source.startswith('state-spaces/mamba2-'):
+    # if the source starts with 'state-spaces/mamba3-' then load the model from HuggingFace
+    if args.source.startswith('state-spaces/mamba3-'):
         model_path = get_model_from_huggingface(args.source)
     else:
         model_path = args.source

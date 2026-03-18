@@ -86,7 +86,6 @@ typedef struct {
     float* B_heads;     // (nheads, d_state)  B after QK-norm + bias + RoPE
     float* C_heads;     // (nheads, d_state)  C after QK-norm + bias + RoPE
     float* dt;          // (nheads)     step sizes after softplus
-    float* Bx;          // (nheads, headdim, d_state)  current B⊗x outer product
     float* y;           // (d_inner)    SSM output before gating
     float* mlp_gate;    // (d_mlp_inner)
     float* mlp_up;      // (d_mlp_inner)
@@ -118,7 +117,6 @@ void malloc_run_state(RunState* s, Config* p) {
     s->B_heads      = malloc(p->nheads * p->d_state * sizeof(float));
     s->C_heads      = malloc(p->nheads * p->d_state * sizeof(float));
     s->dt           = malloc(p->nheads * sizeof(float));
-    s->Bx           = malloc(p->nheads * p->headdim * p->d_state * sizeof(float));
     s->y            = malloc(p->d_inner * sizeof(float));
     s->mlp_gate     = malloc(p->d_mlp_inner * sizeof(float));
     s->mlp_up       = malloc(p->d_mlp_inner * sizeof(float));
@@ -129,7 +127,7 @@ void malloc_run_state(RunState* s, Config* p) {
     s->cum_angle = calloc(p->n_layers * p->nheads * d_state_half, sizeof(float));
 
     if (!s->input || !s->hidden_state || !s->proj || !s->x
-     || !s->B_heads || !s->C_heads || !s->dt || !s->Bx || !s->y
+     || !s->B_heads || !s->C_heads || !s->dt || !s->y
      || !s->mlp_gate || !s->mlp_up || !s->logits
      || !s->ssm_state || !s->prev_Bx || !s->cum_angle) {
         fprintf(stderr, "malloc failed!\n");
@@ -186,7 +184,6 @@ void free_run_state(RunState* s) {
     free(s->B_heads);
     free(s->C_heads);
     free(s->dt);
-    free(s->Bx);
     free(s->y);
     free(s->mlp_gate);
     free(s->mlp_up);
@@ -341,28 +338,141 @@ void matmul(float* xout, float* x, float* w, int d, int n) {
     }
 }
 
-// Apply data-dependent RoPE to x in-place.
-// x:      (nheads, d_state) — B or C projection to rotate
-// angles: (nheads, d_state/2) — cumulative rotation angles (already negated)
-// Rotates each (x[2j], x[2j+1]) pair by angles[j] per head.
-void apply_rope(float* x, float* angles, int nheads, int d_state) {
+// Fused: QK-norm on B and C, dt discretization, cumulative RoPE angle update,
+// per-head broadcast with bias, and RoPE rotation — all in one kernel.
+//
+// Fuses (previously separate passes):
+//   1. rmsnorm(B_raw, B_raw, B_norm_w)  + rmsnorm(C_raw, C_raw, C_norm_w)
+//   2. dt[h] = softplus(dt_raw[h] + dt_bias_w[h])
+//   3. cum_angle[h,j] -= dt[h] * theta[j]
+//   4. B_heads[h,n] = B_qknorm[n] + B_bias_w[h,n]
+//      C_heads[h,n] = C_qknorm[n] + C_bias_w[h,n]
+//   5. apply_rope(B_heads, cum_angle)  +  apply_rope(C_heads, cum_angle)
+//
+// dt_out[h] = softplus(dt_raw[h] + dt_bias_w[h])  written for use by selective_scan.
+void prepare_BC_mamba3(
+    float* B_heads, float* C_heads,     // out: (nheads, d_state)
+    float* cum_angle,                   // in/out: (nheads, d_state/2)
+    float* dt_out,                      // out: (nheads) discretized dt
+    const float* B_raw, const float* C_raw,        // in: (d_state)
+    const float* B_norm_w, const float* C_norm_w,  // in: (d_state) QK-norm weights
+    const float* B_bias_w, const float* C_bias_w,  // in: (nheads, d_state)
+    const float* theta,                 // in: (d_state/2) per-dim RoPE increments
+    const float* dt_raw,                // in: (nheads)
+    const float* dt_bias_w,             // in: (nheads)
+    int nheads, int d_state)
+{
     int half = d_state / 2;
+
+    // QK-norm scale factors: one reduction over d_state per B and C (shared across heads)
+    float ss_B = 0.0f;
+    float ss_C = 0.0f;
+    for (int n = 0; n < d_state; n++) {
+        ss_B += B_raw[n] * B_raw[n];
+        ss_C += C_raw[n] * C_raw[n];
+    }
+    ss_B = 1.0f / sqrtf(ss_B / d_state + 1e-5f);
+    ss_C = 1.0f / sqrtf(ss_C / d_state + 1e-5f);
+
+    // Per-head: discretize dt, update angles, broadcast B/C with QK-norm+bias, apply RoPE
     #pragma omp parallel for
     for (int h = 0; h < nheads; h++) {
-        float* xh = x + h * d_state;
-        float* ah = angles + h * half;
+        float dt_h = logf(1.0f + expf(dt_raw[h] + dt_bias_w[h]));
+        dt_out[h] = dt_h;
+
+        float* bh = B_heads + h * d_state;
+        float* ch = C_heads + h * d_state;
+        float* ah = cum_angle + h * half;
+        const float* bb = B_bias_w + h * d_state;
+        const float* cb = C_bias_w + h * d_state;
+
+        // Update cumulative angle: ah[j] -= dt_h * theta[j]
         for (int j = 0; j < half; j++) {
-            float x1 = xh[2 * j];
-            float x2 = xh[2 * j + 1];
-            float c = cosf(ah[j]);
-            float s = sinf(ah[j]);
-            xh[2 * j]     = c * x1 - s * x2;
-            xh[2 * j + 1] = s * x1 + c * x2;
+            ah[j] -= dt_h * theta[j];
+        }
+
+        // Broadcast QK-normed B/C to this head, add per-head bias
+        for (int n = 0; n < d_state; n++) {
+            bh[n] = B_raw[n] * B_norm_w[n] * ss_B + bb[n];
+            ch[n] = C_raw[n] * C_norm_w[n] * ss_C + cb[n];
+        }
+
+        // Apply RoPE to B and C for this head
+        for (int j = 0; j < half; j++) {
+            float c   = cosf(ah[j]);
+            float sv  = sinf(ah[j]);
+
+            float b1  = bh[2*j];
+            float b2  = bh[2*j+1];
+            bh[2*j]   = c * b1 - sv * b2;
+            bh[2*j+1] = sv * b1 + c * b2;
+
+            float c1  = ch[2*j];
+            float c2  = ch[2*j+1];
+            ch[2*j]   = c * c1 - sv * c2;
+            ch[2*j+1] = sv * c1 + c * c2;
         }
     }
 }
 
-// Forward one Mamba-3 layer: SSM mixer (with trapezoidal recurrence + RoPE) + SwiGLU MLP.
+// Fused: trapezoidal SSM recurrence with λ discretization, state update, output,
+// D·x skip connection, silu(z) gating, and in-place prev_Bx save.
+//
+// Fuses (previously separate passes):
+//   1. lam[h] = sigmoid(lam_raw[h])
+//   2. alpha = exp(dt*A), beta = (1-lam)*dt*alpha, gamma = lam*dt
+//   3. bx = B_heads[h,n] * x[h,p]  (outer product, no longer stored separately)
+//   4. ssm_state = alpha*ssm_state + beta*prev_Bx + gamma*bx  (trapezoidal update)
+//   5. prev_Bx = bx                  (replaces final memcpy of Bx→prev_Bx)
+//   6. y[h,p] = dot(ssm_state[h,p,:], C_heads[h,:]) + D[h]*x[h,p]
+//   7. y[h,p] *= silu(z[h,p])        (gate, replaces separate y *= silu(z) loop)
+//
+// The separate s->Bx buffer is eliminated: prev_Bx is updated in-place here.
+void selective_scan_mamba3(
+    float* y,          // out: (nheads, headdim) gated SSM output
+    float* ssm_state,  // in/out: (nheads, headdim, d_state)
+    float* prev_Bx,    // in/out: (nheads, headdim, d_state) — β term; updated to current Bx
+    const float* dt,   // in: (nheads) discretized step sizes
+    const float* lam_raw,  // in: (nheads) raw λ before sigmoid
+    const float* A,    // in: (nheads) decay (already negative: A = −exp(A_log))
+    const float* D,    // in: (nheads) skip connection
+    const float* x,    // in: (nheads, headdim)
+    const float* B_heads,  // in: (nheads, d_state) QK-normed, biased, RoPEd
+    const float* C_heads,  // in: (nheads, d_state) QK-normed, biased, RoPEd
+    const float* z,    // in: (nheads, headdim) gate before silu
+    int nheads, int headdim, int d_state)
+{
+    #pragma omp parallel for
+    for (int h = 0; h < nheads; h++) {
+        float lam_h     = 1.0f / (1.0f + expf(-lam_raw[h]));
+        float alpha     = expf(dt[h] * A[h]);
+        float beta      = (1.0f - lam_h) * dt[h] * alpha;
+        float gamma_val = lam_h * dt[h];
+        float D_h       = D[h];
+
+        for (int pp = 0; pp < headdim; pp++) {
+            int hp     = h * headdim + pp;
+            float xhp  = x[hp];
+            float y_hp = 0.0f;
+            int base   = h * headdim * d_state + pp * d_state;
+
+            for (int n = 0; n < d_state; n++) {
+                float bx        = B_heads[h * d_state + n] * xhp;
+                float new_state = alpha     * ssm_state[base + n]
+                                + beta      * prev_Bx[base + n]
+                                + gamma_val * bx;
+                prev_Bx[base + n]   = bx;          // save Bx for next token's β term
+                ssm_state[base + n] = new_state;
+                y_hp += new_state * C_heads[h * d_state + n];
+            }
+            // fuse D·x addition and silu(z) gate into a single write
+            float z_hp = z[hp];
+            y[hp] = (y_hp + D_h * xhp) * z_hp / (1.0f + expf(-z_hp));
+        }
+    }
+}
+
+// Forward one Mamba-3 layer: SSM mixer (trapezoidal recurrence + RoPE) + SwiGLU MLP.
 // input is modified in-place (residual stream).
 void forward_layer(Mamba* mamba, unsigned long long l, float* input) {
     Config* p = &mamba->config;
@@ -416,82 +526,27 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* input) {
     // Copy x into scratch buffer (nheads, headdim)
     memcpy(s->x, x_raw, d_inner * sizeof(float));
 
-    // Discretization: dt = softplus(dt + dt_bias), lam = sigmoid(lam)
-    float* dt = s->dt;
-    for (int h = 0; h < nheads; h++) {
-        dt[h]  = softplus(dt_raw[h] + dt_bias_w[h]);
-        lam[h] = sigmoid(lam[h]);
-    }
+    // Fused: QK-norm B/C + dt discretization + cum_angle update + broadcast+bias+RoPE
+    // Writes s->dt[h] = softplus(dt_raw[h] + dt_bias_w[h]) as a side effect.
+    prepare_BC_mamba3(
+        s->B_heads, s->C_heads, cum_angle, s->dt,
+        B_raw, C_raw, B_norm_w, C_norm_w,
+        B_bias_w, C_bias_w, theta,
+        dt_raw, dt_bias_w,
+        nheads, d_state);
 
-    // QK-Normalization on B and C (Section 3.4)
-    rmsnorm(B_raw, B_raw, B_norm_w, d_state);
-    rmsnorm(C_raw, C_raw, C_norm_w, d_state);
-
-    // Update cumulative RoPE angles: cum_angle[h,j] -= dt[h] * theta[j]
-    // (negative because we accumulate −Σ Δ_i*θ_i)
-    #pragma omp parallel for
-    for (int h = 0; h < nheads; h++) {
-        for (int j = 0; j < d_state_half; j++) {
-            cum_angle[h * d_state_half + j] -= dt[h] * theta[j];
-        }
-    }
-
-    // Broadcast B and C to all heads, add head-specific bias, then apply RoPE.
-    // QK-norm → add bias → RoPE.
-    #pragma omp parallel for
-    for (int h = 0; h < nheads; h++) {
-        for (int n = 0; n < d_state; n++) {
-            s->B_heads[h * d_state + n] = B_raw[n] + B_bias_w[h * d_state + n];
-            s->C_heads[h * d_state + n] = C_raw[n] + C_bias_w[h * d_state + n];
-        }
-    }
-    apply_rope(s->B_heads, cum_angle, nheads, d_state);
-    apply_rope(s->C_heads, cum_angle, nheads, d_state);
-
-    // Trapezoidal state update + output computation (Proposition 1, Eq. 4):
-    //   α   = exp(Δ * A)              — decay (A is already negative: A = -exp(A_log))
-    //   β   = (1 − λ) * Δ * α        — left-endpoint coefficient (previous input)
-    //   γ   = λ * Δ                  — right-endpoint coefficient (current input)
-    //   Bx  = outer(B̄_t, x_t)        — current contribution
-    //   h_t = α * h_{t-1} + β * Bx_{t-1} + γ * Bx_t
-    //   y_t = h_t^T C̄_t + D * x_t
-    #pragma omp parallel for
-    for (int h = 0; h < nheads; h++) {
-        float alpha     = expf(dt[h] * A_w[h]);
-        float beta      = (1.0f - lam[h]) * dt[h] * alpha;
-        float gamma_val = lam[h] * dt[h];
-        float D_h       = D_w[h];
-
-        for (int pp = 0; pp < headdim; pp++) {
-            float xhp = s->x[h * headdim + pp];
-            float y_hp = 0.0f;
-
-            for (int n = 0; n < d_state; n++) {
-                int idx = h * headdim * d_state + pp * d_state + n;
-                float bx = s->B_heads[h * d_state + n] * xhp;
-                s->Bx[idx] = bx;
-                ssm_state[idx] = alpha    * ssm_state[idx]
-                               + beta     * prev_Bx[idx]
-                               + gamma_val * bx;
-                y_hp += ssm_state[idx] * s->C_heads[h * d_state + n];
-            }
-            s->y[h * headdim + pp] = y_hp + D_h * xhp;
-        }
-    }
-
-    // Gate: y = y ⊙ silu(z)
-    #pragma omp parallel for
-    for (int i = 0; i < d_inner; i++) {
-        s->y[i] *= silu(z[i]);
-    }
+    // Fused: lam sigmoid + α/β/γ + trapezoidal state update + y output +
+    //        D·x skip + silu(z) gate + prev_Bx save (no separate Bx buffer needed)
+    selective_scan_mamba3(
+        s->y, ssm_state, prev_Bx,
+        s->dt, lam, A_w, D_w,
+        s->x, s->B_heads, s->C_heads, z,
+        nheads, headdim, d_state);
 
     // Output projection and residual connection
     matmul(s->hidden_state, s->y, out_proj_w, dim, d_inner);
     #pragma omp parallel for
     for (int i = 0; i < dim; i++) { input[i] += s->hidden_state[i]; }
-
-    // Save Bx → prev_Bx for next token's β term
-    memcpy(prev_Bx, s->Bx, nheads * headdim * d_state * sizeof(float));
 
     // ====================================================================
     // SwiGLU MLP  (Llama-style: SwiGLU(x) = W_down(silu(W_gate(x)) ⊙ W_up(x)))

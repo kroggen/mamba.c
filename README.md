@@ -86,6 +86,7 @@ There is also code for Mamba 2:
 And for Mamba 3 (ICLR 2026):
 
 * `mamba3-learning` - very basic ([compare with mamba2](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba3-learning))
+* `mamba3-fused` - fused functions ([compare with learning](https://github.com/kroggen/mamba.c/compare/mamba3-learning..mamba3-fused) | [compare with mamba2](https://github.com/kroggen/mamba.c/compare/mamba2-fused..mamba3-fused))
 
 Mamba-3 key changes vs Mamba-2:
 - **Trapezoidal discretization**: `h_t = α*h_{t-1} + β*B̄_{t-1}x_{t-1} + γ*B̄_t*x_t` (requires tracking `prev_Bx`)

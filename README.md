@@ -6,7 +6,7 @@
 
 <p align="right"><a href="https://github.com/kroggen/mamba.c/blob/learning/README-zh.md">中文</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ja.md">日本語</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ru.md">Русский</a></p>
 
-Inference of Mamba 1 & 2 models in pure C
+Inference of Mamba 1, 2 & 3 models in pure C
 
 Inspired by and using code from [llama2.c](https://github.com/karpathy/llama2.c)
 
@@ -84,6 +84,19 @@ There is also code for Mamba 2:
 
 * `mamba2-learning` - very basic ([compare with mamba1](https://github.com/kroggen/mamba.c/compare/learning..mamba2-learning))
 * `mamba2-fused` - fused functions ([compare with learning](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba2-fused) | [compare with mamba1](https://github.com/kroggen/mamba.c/compare/fused..mamba2-fused))
+
+And for Mamba 3:
+
+* `mamba3-learning` - very basic ([compare with mamba2](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba3-learning))
+* `mamba3-fused` - fused functions ([compare with learning](https://github.com/kroggen/mamba.c/compare/mamba3-learning..mamba3-fused) | [compare with mamba2](https://github.com/kroggen/mamba.c/compare/mamba2-fused..mamba3-fused))
+
+Mamba-3 key changes vs Mamba-2:
+- **Trapezoidal discretization**: `h_t = α*h_{t-1} + β*B̄_{t-1}x_{t-1} + γ*B̄_t*x_t` (requires tracking `prev_Bx`)
+- **Data-dependent RoPE**: B and C are rotated by cumulative angles derived from input θ and step size Δ
+- **QK-normalization**: RMSNorm applied to B and C after projection (replaces the gated RMSNorm output norm)
+- **Learnable BC bias**: head-specific bias added to B and C after QK-norm, initialized to ones
+- **No short convolution**: the trapezoidal rule + bias makes conv1d unnecessary
+- **Llama-style architecture**: each layer is `RMSNorm → SSM → residual → RMSNorm → SwiGLU MLP → residual`
 
 
 ## Notes

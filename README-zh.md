@@ -6,7 +6,7 @@
 
 <p align="right"><a href="https://github.com/kroggen/mamba.c/blob/learning/README.md">English</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ja.md">日本語</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ru.md">Русский</a></p>
 
-纯C语言推断Mamba 1 & 2模型
+纯C语言推断Mamba 1、2 & 3模型
 
 受到[llama2.c](https://github.com/karpathy/llama2.c)的启发并使用其代码
 
@@ -83,6 +83,19 @@ Mamba 2的代码也可用：
 
 * `mamba2-learning` - 非常基础（[与mamba1比较](https://github.com/kroggen/mamba.c/compare/learning..mamba2-learning)）
 * `mamba2-fused` - 融合函数（[与learning比较](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba2-fused) | [与mamba1比较](https://github.com/kroggen/mamba.c/compare/fused..mamba2-fused)）
+
+以及Mamba 3：
+
+* `mamba3-learning` - 非常基础（[与mamba2比较](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba3-learning)）
+* `mamba3-fused` - 融合函数（[与learning比较](https://github.com/kroggen/mamba.c/compare/mamba3-learning..mamba3-fused) | [与mamba2比较](https://github.com/kroggen/mamba.c/compare/mamba2-fused..mamba3-fused)）
+
+Mamba-3相对于Mamba-2的关键变化：
+- **梯形离散化**: `h_t = α*h_{t-1} + β*B̄_{t-1}x_{t-1} + γ*B̄_t*x_t`（需要跟踪`prev_Bx`）
+- **数据依赖RoPE**: B和C由从输入θ和步长Δ导出的累积角度旋转
+- **QK归一化**: 投影后对B和C应用RMSNorm（取代门控RMSNorm输出归一化）
+- **可学习BC偏置**: 在QK-norm后添加到B和C的头部特定偏置，初始化为1
+- **无短卷积**: 梯形规则 + 偏置使conv1d不必要
+- **Llama风格架构**: 每个层为`RMSNorm → SSM → 残差 → RMSNorm → SwiGLU MLP → 残差`
 
 
 ## 注释

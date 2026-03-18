@@ -6,7 +6,7 @@
 
 <p align="right"><a href="https://github.com/kroggen/mamba.c/blob/learning/README.md">English</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-zh.md">中文</a> | <a href="https://github.com/kroggen/mamba.c/blob/learning/README-ja.md">日本語</a></p>
 
-Вывод моделей Mamba 1 & 2 на чистом C
+Вывод моделей Mamba 1, 2 & 3 на чистом C
 
 Вдохновлен и использует код из [llama2.c](https://github.com/karpathy/llama2.c)
 
@@ -84,6 +84,19 @@ python3 export.py . model.bin
 
 * `mamba2-learning` - очень базовая ([сравнить с mamba1](https://github.com/kroggen/mamba.c/compare/learning..mamba2-learning))
 * `mamba2-fused` - объединённые функции ([сравнить с learning](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba2-fused) | [сравнить с mamba1](https://github.com/kroggen/mamba.c/compare/fused..mamba2-fused))
+
+А также для Mamba 3:
+
+* `mamba3-learning` - очень базовая ([сравнить с mamba2](https://github.com/kroggen/mamba.c/compare/mamba2-learning..mamba3-learning))
+* `mamba3-fused` - объединённые функции ([сравнить с learning](https://github.com/kroggen/mamba.c/compare/mamba3-learning..mamba3-fused) | [сравнить с mamba2](https://github.com/kroggen/mamba.c/compare/mamba2-fused..mamba3-fused))
+
+Ключевые изменения Mamba-3 по сравнению с Mamba-2:
+- **Трапецеидальная дискретизация**: `h_t = α*h_{t-1} + β*B̄_{t-1}x_{t-1} + γ*B̄_t*x_t` (требуется отслеживание `prev_Bx`)
+- **Зависимый от данных RoPE**: B и C вращаются накопленными углами, полученными из входных θ и размера шага Δ
+- **QK-нормализация**: RMSNorm применяется к B и C после проекции (заменяет норму выхода с гейтом RMSNorm)
+- **Обучаемый смещение BC**: смещение, специфичное для головы, добавляется к B и C после QK-norm, инициализируется единицами
+- **Без короткой свёртки**: трапецеидальное правило + смещение делает conv1d ненужным
+- **Архитектура в стиле Llama**: каждый слой — это `RMSNorm → SSM → остаток → RMSNorm → SwiGLU MLP → остаток`
 
 
 ## Примечания
